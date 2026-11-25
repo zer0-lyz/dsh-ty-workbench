@@ -10914,7 +10914,13 @@ window.__ModuleLoader__.load({
       return wbDiagInfo;
     }
     // 渲染错误边界：面板内部抛错时显示原因，而不是留一片空白。
-    class WbErrorBoundary extends React.Component {
+    // 注意：DSH 宿主前端的 React 有可能是精简 shim（不含 Component）。
+    // 若直接 `extends React.Component`，在模块求值阶段就会抛
+    // "Class extends value undefined is not a constructor"，连带整个 client 模块
+    // factory 失败 → apply() 里的 sidebar.panellist 注册不执行 → 侧栏【个人工作台】消失。
+    // 这里做兜底：有真 Component 就用真错误边界，没有则用最小构造函数保证模块不炸。
+    const WbErrorBase = (React && React.Component) || function ComponentFallback(props) { this.props = props || {}; };
+    class WbErrorBoundary extends WbErrorBase {
       constructor(props) { super(props); this.state = { err: null }; }
       static getDerivedStateFromError(err) { return { err }; }
       componentDidCatch(err) { wbDiag({ renderError: String((err && err.stack) || err).slice(0, 800) }); }
