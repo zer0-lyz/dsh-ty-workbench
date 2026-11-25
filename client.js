@@ -3368,6 +3368,7 @@ window.__ModuleLoader__.load({
       // 切到某家天源项目 → 拉它下面的公司
       const pickTyProject = async tyProjectId => {
         setTy(x => Object.assign({}, x, { companies: [] }));
+        setPending(null); setBatch(null);   // 换了天源项目，之前的确认 token 一律作废
         fsTop(project.id, cid, () => ({ tyProjectId: tyProjectId, tyCompanyId: '' }));
         if (!tyProjectId) return;
         try {
@@ -3463,9 +3464,15 @@ window.__ModuleLoader__.load({
           const d = await r.json().catch(() => ({}));
           if (!r.ok || !d.ok) throw new Error((d && d.error) || ('HTTP ' + r.status));
           setScan(d);
-          const keep = {};
-          (d.packs || []).forEach(p => { keep[p.statementType + '@' + p.year] = true; });
-          setScanKeep(keep);
+          // 重扫时保留用户已经取消的勾选（只给新出现的期默认打勾），免得人工分类一次就把选择清掉
+          setScanKeep(prev => {
+            const keep = {};
+            (d.packs || []).forEach(p => {
+              const k = p.statementType + '@' + p.year;
+              keep[k] = prev[k] === undefined ? true : prev[k];
+            });
+            return keep;
+          });
           const n = (d.packs || []).length;
           const nm = (d.needManual || []).length;
           if (!(d.files || []).length) toast('「01财务报表」文件夹是空的：把各期报表放进去再点一次（已帮你把目录建好）', 'warn');
@@ -3476,8 +3483,14 @@ window.__ModuleLoader__.load({
         } finally { setBusy(''); }
       };
       // 人工指定某页的分类 → 记下选择后重扫（force 覆盖自动判定）
-      const setSheetKind = (fileName, sheet, kind) => {
-        const next = Object.assign({}, scanForce, { [fileName + '::' + sheet]: kind });
+      const setSheetKind = (fileName, sheet, kind, year) => {
+        const key = fileName + '::' + sheet;
+        const prev = scanForce[key];
+        const asObj = prev && typeof prev === 'object' ? Object.assign({}, prev) : { kind: prev || '' };
+        if (kind !== undefined) asObj.kind = kind;
+        if (year !== undefined) asObj.year = year;
+        const val = (asObj.year ? asObj : asObj.kind);   // 只有分类时仍存字符串，force 更好读
+        const next = Object.assign({}, scanForce, { [key]: val });
         setScanForce(next);
         scanFolder(next);
       };
@@ -3544,7 +3557,10 @@ window.__ModuleLoader__.load({
             },
           }));
         }
-        setBatch({ runs: [], errors: failed.map(x => ({ statementType: x.statementType, error: x.error + '（' + x.years.join('/') + '）', details: [] })) });
+        // 全部成功就把这张确认卡收掉；有失败的留着，让用户看清哪张没写进去
+        setBatch(failed.length
+          ? { runs: [], errors: failed.map(x => ({ statementType: x.statementType, error: x.error + '（' + x.years.join('/') + '）', details: [] })) }
+          : null);
         if (done.length) toast('已写入天源 ' + done.length + ' 张表：' + done.map(r => (r.statementType === 'income_statement' ? '利润表' : '资产负债表') + r.years.join('/')).join('、'), 'info');
         if (failed.length) toast(failed.length + ' 张表写入失败，看下面的原因', 'warn');
         setBusy('');
@@ -3821,18 +3837,36 @@ window.__ModuleLoader__.load({
       // 扫描结果里「认不出的页」：让人工指定这页是资产负债表还是利润表
       const kindOptions = m => ['', 'balance', 'income', 'skip'].map(v => h('option', { key: v || 'none', value: v },
         v === '' ? '请选择' : (v === 'balance' ? '资产负债表' : (v === 'income' ? '利润表' : '跳过'))));
+      const forceOf = key => {
+        const v = scanForce[key];
+        return v && typeof v === 'object' ? v : { kind: v || '', year: '' };
+      };
       const manualRow = (m, i) => {
         const key = m.fileName + '::' + m.sheet;
+        const f = forceOf(key);
+        // 自动已经认出分类的（只是年度读不出），下拉框直接显示认出的那个，省得再选一次
         const sel = h('select', {
           className: 'pf-sel',
-          value: scanForce[key] || '',
+          value: f.kind || m.kind || '',
           onChange: e => setSheetKind(m.fileName, m.sheet, e.target.value),
         }, kindOptions(m));
+        // 表头读不出年度时，让用户直接补一个四位数年份
+        const yr = m.needYear
+          ? h('input', {
+            className: 'pf-in', style: { width: 76, marginLeft: 4, padding: '0 4px' }, placeholder: '年度', maxLength: 4,
+            value: f.year || '',
+            onChange: e => {
+              const v = e.target.value.replace(/[^0-9]/g, '').slice(0, 4);
+              if (v.length === 4 && Number(v) > 1900 && Number(v) < 2200) setSheetKind(m.fileName, m.sheet, undefined, v);
+              else setScanForce(Object.assign({}, scanForce, { [key]: Object.assign({}, f, { year: v }) }));
+            },
+          })
+          : null;
         return h('tr', { key: i },
           h('td', null, m.fileName),
           h('td', null, m.sheet),
           h('td', { className: 'pf-hint' }, m.reason),
-          h('td', null, sel));
+          h('td', null, sel, yr));
       };
       const needManualBox = (scan && (scan.needManual || []).length)
         ? h('div', { className: 'pf-table-wrap', style: { maxHeight: 200, overflow: 'auto', marginTop: 6 } },
@@ -3925,12 +3959,12 @@ window.__ModuleLoader__.load({
           h('div', { className: 'pw-filters' },
             lockId
               ? h('label', null, '公司', h('span', { className: 'pf-hint' }, cid ? (cur.code + ' ' + cur.name) : '—'))
-              : h('label', null, '公司', h('select', { className: 'pf-sel', value: cid, onChange: e => setWho(e.target.value) }, rows.map(r => h('option', { key: r.id, value: r.id }, r.code + ' ' + r.name)))),
+              : h('label', null, '公司', h('select', { className: 'pf-sel', value: cid, onChange: e => { setWho(e.target.value); setScan(null); setBatch(null); } }, rows.map(r => h('option', { key: r.id, value: r.id }, r.code + ' ' + r.name)))),
             h('button', { type: 'button', className: 'pf-btn', disabled: busy === 'import', onClick: () => fileRef.current && fileRef.current.click() }, busy === 'import' ? '读取中…' : '导入科目余额表'),
             h('button', { type: 'button', className: 'pf-btn', title: '从绑定的天源项目拉这家公司资产基础法的非零科目（金额以天源为准，本地独有的科目保留）', disabled: busy === 'sync', onClick: syncTy }, busy === 'sync' ? '同步中…' : '从天源同步科目'),
             h('button', { type: 'button', className: 'pf-btn', title: '把天源这家公司「资产基础法/*/查证资料（含盘点/担保/科目通用文件/其他）」的文件下载到本地对应科目夹', disabled: busy === 'pull', onClick: pullFiles }, busy === 'pull' ? '拉取中…' : '拉查证资料'),
             h('button', { type: 'button', className: 'pf-btn', onClick: clearAll }, '清空')),
-            h('label', null, '报表口径', h('select', { className: 'pf-sel', value: mode, onChange: e => { setMode(e.target.value); setPending(null); setResult(null); } },
+            h('label', null, '报表口径', h('select', { className: 'pf-sel', value: mode, onChange: e => { setMode(e.target.value); setPending(null); setResult(null); setBatch(null); } },
               h('option', { value: '1' }, '单体'), h('option', { value: '2' }, '合并')),
             h('label', { title: baseDate ? ('从评估基准日 ' + baseDate + ' 所在年度往前推') : '项目里还没填评估基准日' }, '报表显示期数',
               h('select', { className: 'pf-sel', value: String(nPeriods), onChange: e => setPeriods(e.target.value) },
@@ -3959,7 +3993,7 @@ window.__ModuleLoader__.load({
               h('option', { value: '' }, ty.status === 'on' ? '选择天源项目' : (ty.status === 'loading' ? '连接中…' : '天源未连接')),
               tyOpts),
             h('span', { className: 'pf-hint' }, '公司 '),
-            h('select', { className: 'pf-sel', style: { maxWidth: 260 }, value: String(box.tyCompanyId || ''), onChange: e => fsTop(project.id, cur.id, () => ({ tyCompanyId: e.target.value })) },
+            h('select', { className: 'pf-sel', style: { maxWidth: 260 }, value: String(box.tyCompanyId || ''), onChange: e => { fsTop(project.id, cur.id, () => ({ tyCompanyId: e.target.value })); setPending(null); setBatch(null); } },
               h('option', { value: '' }, '选择天源公司'), tyCOpts))),
         // ── 页签：资产负债表 / 利润表
         h('div', { className: 'pw-tabs' },
@@ -5294,7 +5328,10 @@ window.__ModuleLoader__.load({
       const [busy, setBusy] = useState(false);
       const [loadError, setLoadError] = useState(null);   // 读模板失败的原始错误（展示出来便于定位）
       const [confirmDel, setConfirmDel] = useState('');   // 待二次确认删除的节点 path key（不用 confirm()，webview 可能禁弹窗）
+      let loadLoading = false;                            // 模块渲染级防重入标志（配合 busy 用，兼容 shim 的 effect 行为）
       const load = async () => {
+        if (loadLoading) return;
+        loadLoading = true;
         setBusy(true); setLoadError(null);
         try {
           const r = await fetch(PREFIX + '/project/folders/template');
@@ -5311,7 +5348,11 @@ window.__ModuleLoader__.load({
         }
         setBusy(false);
       };
-      useEffect(() => { load(); }, []);
+      // 兼容宿主 React 精简 shim：依赖数组 [] 的 effect 可能不触发（或错误边界重挂后不跑）。
+      // 改为每次渲染后检查一次；load 内部用 loading 标志防重入，tpl 到手后不再重复请求。
+      useEffect(() => {
+        if (!tpl && !busy && !loadLoading) load();
+      });
       const dirty = () => JSON.stringify(tpl) !== JSON.stringify(saved);
       const edit = updater => {
         // 不在 setTpl 的 updater 里调 onDirtyChange（那是在渲染阶段调父组件 setState，会告警/竞态）。
@@ -5388,7 +5429,7 @@ window.__ModuleLoader__.load({
             onClick: () => {
               // 不用 confirm()（部分宿主 webview 会禁掉弹窗，点了像没反应）；两段式：第一次点变红色「确认删除？」，再点才删，3 秒不点自动复位。
               const k = path.join('.');
-              if (confirmDel !== k) { setConfirmDel(k); setTimeout(() => setConfirmDel(cur => (cur === k ? '' : cur)), 3000); return; }
+              if (confirmDel !== k) { setConfirmDel(k); setTimeout(() => { try { setConfirmDel(''); } catch (_) {} }, 3000); return; }
               setConfirmDel('');
               remove(path);
             },
