@@ -35,7 +35,20 @@ function defaultTreeFromPaths() {
   STATIC_DIRS.forEach(p => ensure(p.split('/')));
   ensure(MGMT_FOLDER.split('/'));
   MGMT_CATEGORIES.forEach(cat => ensure(MGMT_FOLDER.split('/').concat(cat)));
-  return { version: 1, groups: root.children.map(c => ({ name: c.name, children: c.children.map(g => ({ name: g.name, children: g.children.map(x => ({ name: x.name })) })) })) };
+  // 企业提供资料下预留五个方法段骨架：公司相关子目录（00财务资料/<公司>、
+  // 02基础类/<公司>/<分类>、03资产基础法/<公司>/<科目>/…、04收益法、05市场法）
+  // 由规则在建目录时动态补齐，但骨架层先进模板树，模板页能看到全貌。
+  ['00财务资料', '02基础类', '03资产基础法', '04收益法', '05市场法'].forEach(seg => {
+    ensure(['02现场资料', '企业提供资料', seg]);
+    if (seg === '04收益法') INCOME_CHILDREN.forEach(ch => ensure(['02现场资料', '企业提供资料', seg, ch]));
+  });
+  // 通用递归序列化：固定三层 map 会把第 4 层（如 04收益法/07折现率）丢掉
+  const ser = n => {
+    const out = { name: n.name };
+    if (n.children && n.children.length) out.children = n.children.map(ser);
+    return out;
+  };
+  return { version: 1, groups: root.children.map(ser) };
 }
 export const DEFAULT_FOLDER_TEMPLATE = defaultTreeFromPaths();
 
@@ -139,7 +152,10 @@ function companyPaths(companies) {
 
 // 建目录总计划：模板树（固定骨架）+ 公司相关目录
 export function folderTemplatePlan(template, companies) {
-  return treeToPaths(template || DEFAULT_FOLDER_TEMPLATE).concat(companyPaths(companies));
+  const all = treeToPaths(template || DEFAULT_FOLDER_TEMPLATE).concat(companyPaths(companies));
+  // 模板骨架与公司段必然重叠（固定目录两边都算了一遍），去重且保持先父后子顺序
+  const seen = new Set();
+  return all.filter(p => (seen.has(p) ? false : (seen.add(p), true)));
 }
 
 export async function readFolderTemplate(file = FOLDER_TEMPLATE_PATH) {

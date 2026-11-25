@@ -22,6 +22,21 @@ test('默认树覆盖全部静态骨架与管理类分类', () => {
   for (const p of STATIC_DIRS) assert.ok(paths.has(p), '缺静态目录 ' + p);
   assert.ok(paths.has(MGMT_FOLDER));
   for (const cat of MGMT_CATEGORIES) assert.ok(paths.has(MGMT_FOLDER + '/' + cat));
+  // 企业提供资料下五个方法段骨架：模板页能看到全貌（公司相关子目录仍由规则动态补齐）
+  ['00财务资料', '02基础类', '03资产基础法', '04收益法', '05市场法'].forEach(seg => {
+    assert.ok(paths.has('02现场资料/企业提供资料/' + seg), '缺方法段骨架 ' + seg);
+  });
+  assert.ok(paths.has('02现场资料/企业提供资料/04收益法/07折现率'), '收益法 01~07 固定子目录应在模板里');
+});
+
+test('folderTemplatePlan 去重且先父后子', () => {
+  const plan = folderTemplatePlan(DEFAULT_FOLDER_TEMPLATE, [{
+    name: '测试公司', methods: { whole: ['资产基础法'] }, subjects: [{ name: '货币资金', amount: 1 }],
+  }]);
+  assert.equal(new Set(plan).size, plan.length, '模板与公司段合并后有重复');
+  const idx = plan.indexOf('02现场资料/企业提供资料/03资产基础法');
+  const idxCo = plan.indexOf('02现场资料/企业提供资料/03资产基础法/测试公司/01货币资金');
+  assert.ok(idx >= 0 && idxCo > idx, '先父后子顺序被破坏');
 });
 
 test('树转路径先父后子且无重复', () => {
