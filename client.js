@@ -5320,33 +5320,36 @@ window.__ModuleLoader__.load({
     // ---------- 文件夹模板 · 参数设定页 ----------
     // 目录树的可视化管理：增删改任意层级目录，保存后 /project/folders/build 就按它建骨架。
     // 数据契约见 folder-template.js：{ version:1, groups:[{ name, children:[…] }] }，层级≤5、目录≤400。
-    function FolderTemplatePage({ toast, onDirtyChange }) {
+    function FolderTemplatePage({ toast, onDirtyChange, tpl: tplProp, setTpl, saved: savedProp, setSaved, ui, setUi }) {
       const REV = 'r20261125-2300';   // 版本标记：显示在页头，用于确认面板加载的是哪一代 client.js
-      const [tpl, setTpl] = useState(null);          // 当前编辑中的树
-      const [saved, setSaved] = useState(null);      // 已保存（服务器侧）的树，用于 dirty 判断
-      const [isDefault, setIsDefault] = useState(true);
-      const [busy, setBusy] = useState(false);
-      const [loadError, setLoadError] = useState(null);   // 读模板失败的原始错误（展示出来便于定位）
-      const [confirmDel, setConfirmDel] = useState('');   // 待二次确认删除的节点 path key（不用 confirm()，webview 可能禁弹窗）
-      let loadLoading = false;                            // 模块渲染级防重入标志（配合 busy 用，兼容 shim 的 effect 行为）
+      // 状态全部提升到 WorkbenchPage（宿主 shim 对子组件 setState 重渲染不可靠，见 WorkbenchPage 注释）。
+      // 这里 tpl/saved/ui 只是 prop 的短别名；loadLoading 放在模块级闭包外的可变槽（组件重挂也不重复请求）。
+      const tpl = tplProp; const saved = savedProp;
+      const isDefault = !!(ui && ui.isDefault);
+      const busy = !!(ui && ui.busy);
+      const loadError = (ui && ui.loadError) || null;
+      const confirmDel = (ui && ui.confirmDel) || '';
+      const patchUi = p => setUi(Object.assign({}, ui, p));
+      let loadLoading = FolderTemplatePage.__loading === true;
       const load = async () => {
         if (loadLoading) return;
-        loadLoading = true;
-        setBusy(true); setLoadError(null);
+        FolderTemplatePage.__loading = true;
+        patchUi({ busy: true, loadError: null });
         try {
           const r = await fetch(PREFIX + '/project/folders/template');
           const d = await r.json().catch(() => ({}));
           if (!r.ok || d.error) throw new Error(String(d.error || ('HTTP ' + r.status)));
-          setTpl(d.template); setSaved(d.template); setIsDefault(!!d.isDefault);
+          setTpl(d.template); setSaved(d.template); patchUi({ isDefault: !!d.isDefault, busy: false, loadError: null });
           if (onDirtyChange) onDirtyChange(false);
         } catch (e) {
           // 读不到不再卡死：用内置骨架兜底，页面保持可编辑（保存/恢复默认走服务器，成功即纠正）。
-          setLoadError(String((e && e.message) || e));
+          patchUi({ loadError: String((e && e.message) || e) });
           setTpl({ version: 1, groups: NEW_FOLDER_PREVIEW.map(g => ({ name: g.name, children: g.children.map(c => ({ name: c, children: [] })) })) });
-          setSaved(null); setIsDefault(true);
+          setSaved(null); patchUi({ isDefault: true, busy: false });
           if (onDirtyChange) onDirtyChange(false);
         }
-        setBusy(false);
+        FolderTemplatePage.__loading = false;
+        patchUi({ busy: false });
       };
       // 兼容宿主 React 精简 shim：依赖数组 [] 的 effect 可能不触发（或错误边界重挂后不跑）。
       // 改为每次渲染后检查一次；load 内部用 loading 标志防重入，tpl 到手后不再重复请求。
@@ -5390,29 +5393,27 @@ window.__ModuleLoader__.load({
       });
       const addTop = () => edit(g => { g.groups.push({ name: '新目录', children: [] }); });
       const save = async () => {
-        setBusy(true);
+        patchUi({ busy: true });
         try {
           const r = await fetch(PREFIX + '/project/folders/template', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ template: tpl }) });
           const d = await r.json().catch(() => ({}));
           if (!r.ok || d.error) throw new Error(String(d.error || ('HTTP ' + r.status)));
-          setTpl(d.template); setSaved(d.template); setIsDefault(false);
+          setTpl(d.template); setSaved(d.template); patchUi({ isDefault: false, busy: false });
           if (onDirtyChange) onDirtyChange(false);
           toast('文件夹模板已保存（' + countDirs(d.template) + ' 个目录）', 'ok');
-        } catch (e) { toast('保存失败：' + String((e && e.message) || e), 'danger'); }
-        setBusy(false);
+        } catch (e) { patchUi({ busy: false }); toast('保存失败：' + String((e && e.message) || e), 'danger'); }
       };
       const reset = async () => {
         // 不用 confirm()（webview 可能禁弹窗）；恢复默认本身可再点「保存模板」找回，直接执行。
-        setBusy(true);
+        patchUi({ busy: true });
         try {
           const r = await fetch(PREFIX + '/project/folders/template', { method: 'DELETE' });
           const d = await r.json().catch(() => ({}));
           if (!r.ok || d.error) throw new Error(String(d.error || ('HTTP ' + r.status)));
-          setTpl(d.template); setSaved(d.template); setIsDefault(true);
+          setTpl(d.template); setSaved(d.template); patchUi({ isDefault: true, busy: false, confirmDel: '' });
           if (onDirtyChange) onDirtyChange(false);
           toast('已恢复内置默认模板', 'ok');
-        } catch (e) { toast('恢复默认失败：' + String((e && e.message) || e), 'danger'); }
-        setBusy(false);
+        } catch (e) { patchUi({ busy: false }); toast('恢复默认失败：' + String((e && e.message) || e), 'danger'); }
       };
       const renderNode = (node, path, depth) => h('div', { key: path.join('.'), style: { marginLeft: depth ? 18 : 0 } },
         h('div', { style: { display: 'flex', alignItems: 'center', gap: 6, padding: '3px 0' } },
@@ -5429,8 +5430,8 @@ window.__ModuleLoader__.load({
             onClick: () => {
               // 不用 confirm()（部分宿主 webview 会禁掉弹窗，点了像没反应）；两段式：第一次点变红色「确认删除？」，再点才删，3 秒不点自动复位。
               const k = path.join('.');
-              if (confirmDel !== k) { setConfirmDel(k); setTimeout(() => { try { setConfirmDel(''); } catch (_) {} }, 3000); return; }
-              setConfirmDel('');
+              if (confirmDel !== k) { patchUi({ confirmDel: k }); setTimeout(() => { try { patchUi({ confirmDel: '' }); } catch (_) {} }, 3000); return; }
+              patchUi({ confirmDel: '' });
               remove(path);
             },
           }, confirmDel === path.join('.') ? '确认删除？' : '删除'),
@@ -11133,6 +11134,12 @@ window.__ModuleLoader__.load({
       const [toastMsg, setToastMsg] = useState(null);
       const [reportDirty, setReportDirty] = useState(false);
       const [foldersDirty, setFoldersDirty] = useState(false);
+      // 文件夹模板页的状态提升：宿主 React shim 对【子组件】setState 的重渲染不可靠
+      // （点「+ 子目录」只闪一下不更新的实锤），而顶层 setState（页签/toast）一直正常。
+      // 树 tpl / 已保存快照 saved / UI 杂项全部放顶层，FolderTemplatePage 变纯受控组件。
+      const [foldersTpl, setFoldersTpl] = useState(null);
+      const [foldersSaved, setFoldersSaved] = useState(null);
+      const [foldersUi, setFoldersUi] = useState({ isDefault: true, loadError: null, busy: false, confirmDel: '' });
       const [compareDirty, setCompareDirty] = useState(false);
       const [sub, setSub] = useState({ work: 'projects', study: 'plans', stock: '' });
       // 浮动对话窗的开关。放在 WorkbenchPage 里而不是模块级，是为了跟随页签切换保留、
@@ -11288,7 +11295,7 @@ window.__ModuleLoader__.load({
           tab === 'report-compare' ? h(ReportComparePage, { s, toast, onDirtyChange: setCompareDirty }) :
           tab === 'data-tools' ? h(DataTools, { toast }) :
           tab === 'land-market' ? h(LandMarketPanel) :
-          tab === 'folder-template' ? h(FolderTemplatePage, { toast, onDirtyChange: setFoldersDirty }) :
+          tab === 'folder-template' ? h(FolderTemplatePage, { toast, onDirtyChange: setFoldersDirty, tpl: foldersTpl, setTpl: setFoldersTpl, saved: foldersSaved, setSaved: setFoldersSaved, ui: foldersUi, setUi: setFoldersUi }) :
           tab === 'study' ? h(Study, { s, sub: sub.study, toast, go }) :
           tab === 'stock' ? h(Stock, { s, toast, refresh }) :
           tab === 'alerts' ? h(Alerts, { s }) : h(Settings, { s, toast }),
