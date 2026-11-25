@@ -12,7 +12,7 @@ import { open, mkdir, readFile, rename, unlink } from 'node:fs/promises';
 import { randomBytes } from 'node:crypto';
 import { dirname, join } from 'node:path';
 import { homedir } from 'node:os';
-import { STATIC_DIRS, MGMT_FOLDER, MGMT_CATEGORIES, BASIC_CATEGORIES, INCOME_CHILDREN, abFoldersFor, abExtraFolders } from './folders.js';
+import { STATIC_DIRS, MGMT_FOLDER, MGMT_CATEGORIES, BASIC_CATEGORIES, INCOME_CHILDREN, AB_SUBJECTS, abFoldersFor, abExtraFolders } from './folders.js';
 
 export const FOLDER_TEMPLATE_PATH = join(homedir(), '.tycpv', 'folder-template.json');
 export const MAX_FOLDER_TEMPLATE_BYTES = 256 * 1024;
@@ -35,12 +35,24 @@ function defaultTreeFromPaths() {
   STATIC_DIRS.forEach(p => ensure(p.split('/')));
   ensure(MGMT_FOLDER.split('/'));
   MGMT_CATEGORIES.forEach(cat => ensure(MGMT_FOLDER.split('/').concat(cat)));
-  // 企业提供资料下预留五个方法段骨架：公司相关子目录（00财务资料/<公司>、
-  // 02基础类/<公司>/<分类>、03资产基础法/<公司>/<科目>/…、04收益法、05市场法）
-  // 由规则在建目录时动态补齐，但骨架层先进模板树，模板页能看到全貌。
+  // 完整模板树：企业提供资料下五个方法段全部展开（用户要求——模板页就是全部目录的全集，
+  // 生成项目时按公司勾选的方法/科目从这个全集里过滤加载，不在此处动态拼）。
   ['00财务资料', '02基础类', '03资产基础法', '04收益法', '05市场法'].forEach(seg => {
     ensure(['02现场资料', '企业提供资料', seg]);
+    if (seg === '02基础类') BASIC_CATEGORIES.forEach(cat => ensure(['02现场资料', '企业提供资料', seg, cat]));
     if (seg === '04收益法') INCOME_CHILDREN.forEach(ch => ensure(['02现场资料', '企业提供资料', seg, ch]));
+    if (seg === '03资产基础法') AB_SUBJECTS.forEach(def => {
+      const subjBase = ['02现场资料', '企业提供资料', seg, def.folder];
+      ensure(subjBase);
+      ensure(subjBase.concat('查证资料'));
+      abExtraFolders(def.folder).forEach(x => ensure(subjBase.concat(x)));
+      (def.children || []).forEach(ch => {
+        const chBase = subjBase.concat(ch);
+        ensure(chBase);
+        ensure(chBase.concat('查证资料'));
+        ensure(chBase.concat('其他'));
+      });
+    });
   });
   // 通用递归序列化：固定三层 map 会把第 4 层（如 04收益法/07折现率）丢掉
   const ser = n => {
@@ -100,7 +112,7 @@ export function treeToPaths(t) {
 // 公司相关目录：每家公司一套（00财务资料/<公司>、02基础类/<公司>/<分类>、
 // 03资产基础法/<公司>/<有金额的科目>、04收益法/<公司>/01~07、05市场法/<公司>）。
 // 规则与 folders.js planProjectFolders 的公司段一致；方法没有选的目录不建。
-function companyPaths(companies) {
+function companyPaths(companies, template) {
   const rows = Array.isArray(companies) ? companies : [];
   const out = [];
   const seen = new Set();
@@ -113,6 +125,22 @@ function companyPaths(companies) {
       .replace(/[. ]+$/, '');
     return t2.slice(0, 80) || '未命名公司';
   };
+  // 完整模板树里的方法段全集：生成时按「公司勾的方法 + 有金额科目」从中过滤，
+  // 不再动态拼科目夹（模板树就是目录全集，单一事实来源）。
+  const segPrefix = '02现场资料/企业提供资料/';
+  const full = treeToPaths(template || DEFAULT_FOLDER_TEMPLATE).filter(p => p.startsWith(segPrefix));
+  const keep = full.filter(p => {
+    const rest = p.slice(segPrefix.length);
+    if (rest.startsWith('03资产基础法/')) {
+      // 资产基础法段：保留 03资产基础法 本身；科目夹只留有金额科目对应的；
+      // 科目夹下的 查证资料/类型子夹/明细 全部跟随其科目夹
+      const segs = rest.split('/');
+      if (segs.length === 1) return true;
+      const subjFolder = segs[1];
+      return subjectsOf(companies, subjFolder);
+    }
+    return true;
+  });
   const used = new Map();
   rows.forEach(c => {
     const name = String((c && c.name) || '').trim();
@@ -128,20 +156,14 @@ function companyPaths(companies) {
     const whole = Array.isArray(m.whole) ? m.whole : [];
     const has = x => whole.indexOf(x) >= 0;
     if (has('资产基础法')) {
-      // 与天源系统同构：科目夹下固定「查证资料」，再按科目类型加 盘点/担保/科目通用文件/其他；
-      // 带明细（固定资产、无形资产）的科目在明细层各配 查证资料+其他。规则在 folders.js abExtraFolders。
       push(base + '03资产基础法/' + seg);
-      abFoldersFor(c.subjects).forEach(def => {
-        const subjBase = base + '03资产基础法/' + seg + '/' + def.folder;
-        push(subjBase);
-        push(subjBase + '/查证资料');
-        abExtraFolders(def.folder).forEach(x => push(subjBase + '/' + x));
-        (def.children || []).forEach(ch => {
-          const chBase = subjBase + '/' + ch;
-          push(chBase);
-          push(chBase + '/查证资料');
-          push(chBase + '/其他');
-        });
+      // 科目夹从完整模板树里取（<公司> 段替换），不再动态拼——与模板页所见一致
+      const kept = keep.filter(p => p.startsWith(segPrefix + '03资产基础法/'));
+      kept.forEach(p => {
+        const rest = p.slice((segPrefix + '03资产基础法/').length);
+        // 跳过全集里的「03资产基础法」一级本身（上面已 push 过公司段父目录）
+        if (!rest) return;
+        push(base + '03资产基础法/' + seg + '/' + rest);
       });
     }
     if (has('收益法')) INCOME_CHILDREN.forEach(ch => push(base + '04收益法/' + seg + '/' + ch));
@@ -150,10 +172,22 @@ function companyPaths(companies) {
   return out;
 }
 
-// 建目录总计划：模板树（固定骨架）+ 公司相关目录
+// 公司 rows 里有没有任何一家：勾了资产基础法 && subjects 里有金额科目能映射到 subjFolder
+function subjectsOf(companies, subjFolder) {
+  const def = AB_SUBJECTS.filter(x => x.folder === subjFolder)[0];
+  if (!def) return false;
+  const rows = Array.isArray(companies) ? companies : [];
+  return rows.some(c => {
+    const whole = ((c && c.methods) || {}).whole;
+    if (!Array.isArray(whole) || whole.indexOf('资产基础法') < 0) return false;
+    return abFoldersFor(c.subjects).some(x => x.folder === subjFolder);
+  });
+}
+
+// 建目录总计划：模板树（完整全集骨架）+ 公司相关目录（从全集按方法/科目过滤后落到 <公司> 段）
 export function folderTemplatePlan(template, companies) {
-  const all = treeToPaths(template || DEFAULT_FOLDER_TEMPLATE).concat(companyPaths(companies));
-  // 模板骨架与公司段必然重叠（固定目录两边都算了一遍），去重且保持先父后子顺序
+  const all = treeToPaths(template || DEFAULT_FOLDER_TEMPLATE).concat(companyPaths(companies, template));
+  // 模板全集与公司段必然重叠（固定目录两边都算了一遍），去重且保持先父后子顺序
   const seen = new Set();
   return all.filter(p => (seen.has(p) ? false : (seen.add(p), true)));
 }
