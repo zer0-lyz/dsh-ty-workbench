@@ -4285,15 +4285,22 @@ window.__ModuleLoader__.load({
       const [saved, setSaved] = useState(null);      // 已保存（服务器侧）的树，用于 dirty 判断
       const [isDefault, setIsDefault] = useState(true);
       const [busy, setBusy] = useState(false);
+      const [loadError, setLoadError] = useState(null);   // 读模板失败的原始错误（展示出来便于定位）
       const load = async () => {
-        setBusy(true);
+        setBusy(true); setLoadError(null);
         try {
           const r = await fetch(PREFIX + '/project/folders/template');
           const d = await r.json().catch(() => ({}));
           if (!r.ok || d.error) throw new Error(String(d.error || ('HTTP ' + r.status)));
           setTpl(d.template); setSaved(d.template); setIsDefault(!!d.isDefault);
           if (onDirtyChange) onDirtyChange(false);
-        } catch (e) { toast('读取文件夹模板失败：' + String((e && e.message) || e), 'danger'); }
+        } catch (e) {
+          // 读不到不再卡死：用内置骨架兜底，页面保持可编辑（保存/恢复默认走服务器，成功即纠正）。
+          setLoadError(String((e && e.message) || e));
+          setTpl({ version: 1, groups: NEW_FOLDER_PREVIEW.map(g => ({ name: g.name, children: g.children.map(c => ({ name: c, children: [] })) })) });
+          setSaved(null); setIsDefault(true);
+          if (onDirtyChange) onDirtyChange(false);
+        }
         setBusy(false);
       };
       useEffect(() => { load(); }, []);
@@ -4378,6 +4385,8 @@ window.__ModuleLoader__.load({
               '新建/绑定项目时按这棵树生成项目文件夹骨架。' + (dirty() ? '有未保存的修改。' : isDefault ? '当前为内置默认。' : '已保存自定义模板。')
               + ' 各被评估单位的 00财务资料 / 02基础类 / 03资产基础法 / 04收益法 / 05市场法 子目录按公司与评估方法自动补齐，不在这棵树里。')),
           h('div', { className: 'wb-row', style: { gap: 8 } },
+            loadError ? h('span', { className: 'pf-err' }, '读取模板失败（' + loadError + '），当前为内置骨架，可直接编辑；点「重新读取」或「恢复默认」重试。') : null,
+            loadError ? h('button', { type: 'button', className: 'pf-btn', onClick: load, disabled: busy }, '重新读取') : null,
             h('button', { type: 'button', className: 'pf-btn', onClick: addTop, disabled: !tpl }, '+ 一级目录'),
             h('button', { type: 'button', className: 'pf-btn', onClick: reset, disabled: busy }, '恢复默认'),
             h('button', { type: 'button', className: 'pf-btn pri', onClick: save, disabled: busy || !tpl || !dirty() }, busy ? '保存中…' : '保存模板'))),
