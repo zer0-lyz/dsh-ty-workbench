@@ -25,6 +25,7 @@ import * as kbqa from './kbqa.js';
 import * as scanner from './scanner.js';
 import * as store from './store.js';
 import { planProjectFolders } from './folders.js';
+import { folderTemplateRequest, readFolderTemplate, folderTemplatePlan } from './folder-template.js';
 import * as archive from './archive.js';
 import { archiveReportBaseline } from './report-baseline.js';
 import { listBaselines, compareUpload, compareAgainstLive, readManifestForWriteback } from './report-compare-service.js';
@@ -3692,7 +3693,15 @@ export function apply(ctx) {
           if (!base || base.ok === false) return json({ ok: false, error: (base && base.error) || '项目文件夹不存在' }, 400);
           const root = base.path;
           await mkdir(root, { recursive: true });
-          const plan = planProjectFolders({ companies: Array.isArray(b.companies) ? b.companies : [] });
+          // 目录计划：固定骨架取「文件夹模板」页保存的模板（没保存过用内置默认），
+          // 公司相关目录（00财务资料/<公司> 等）仍按 folders.js 规则动态补齐。
+          let plan;
+          try {
+            const tpl = await readFolderTemplate();
+            plan = folderTemplatePlan(tpl, Array.isArray(b.companies) ? b.companies : []);
+          } catch (e) {
+            plan = planProjectFolders({ companies: Array.isArray(b.companies) ? b.companies : [] });
+          }
           let created = 0;
           let existed = 0;
           for (const rel of plan) {
@@ -3712,6 +3721,12 @@ export function apply(ctx) {
           return json({ ok: false, error: String((e && e.message) || e).slice(0, 300) }, 500);
         }
       },
+    },
+    {
+      // 文件夹模板（参数设定页）：GET 读 / POST 存 / DELETE 恢复内置默认。
+      // GET 返回 { ok, template, isDefault }：文件不存在时 isDefault=true 且返回内置默认树。
+      // POST 体为 { template }；DELETE 删掉保存的模板文件（= 回内置默认）。规则见 folder-template.js。
+      path: PREFIX + '/project/folders/template', methods: ['GET', 'POST', 'DELETE'], fetch: (req) => folderTemplateRequest(req),
     },
     {
       // 归档预览（只读）：POST /project/archive/preview { folder, code, shortName, name, year }

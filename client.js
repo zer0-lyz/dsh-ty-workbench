@@ -4277,13 +4277,146 @@ window.__ModuleLoader__.load({
       return out.join('\n').trim();
     }
 
-    // 天源项目「导入」前的选择：新建本地文件夹，还是绑定一个已经存在的文件夹。
+    // ---------- 文件夹模板 · 参数设定页 ----------
+    // 目录树的可视化管理：增删改任意层级目录，保存后 /project/folders/build 就按它建骨架。
+    // 数据契约见 folder-template.js：{ version:1, groups:[{ name, children:[…] }] }，层级≤5、目录≤400。
+    function FolderTemplatePage({ toast, onDirtyChange }) {
+      const [tpl, setTpl] = useState(null);          // 当前编辑中的树
+      const [saved, setSaved] = useState(null);      // 已保存（服务器侧）的树，用于 dirty 判断
+      const [isDefault, setIsDefault] = useState(true);
+      const [busy, setBusy] = useState(false);
+      const load = async () => {
+        setBusy(true);
+        try {
+          const r = await fetch(PREFIX + '/project/folders/template');
+          const d = await r.json().catch(() => ({}));
+          if (!r.ok || d.error) throw new Error(String(d.error || ('HTTP ' + r.status)));
+          setTpl(d.template); setSaved(d.template); setIsDefault(!!d.isDefault);
+          if (onDirtyChange) onDirtyChange(false);
+        } catch (e) { toast('读取文件夹模板失败：' + String((e && e.message) || e), 'danger'); }
+        setBusy(false);
+      };
+      useEffect(() => { load(); }, []);
+      const dirty = () => JSON.stringify(tpl) !== JSON.stringify(saved);
+      const edit = updater => {
+        setTpl(prev => {
+          const next = updater(JSON.parse(JSON.stringify(prev)));
+          if (onDirtyChange) onDirtyChange(JSON.stringify(next) !== JSON.stringify(saved));
+          return next;
+        });
+      };
+      const mutateAt = (groups, path, fn) => {
+        // path 是 ['groups', i, 'children', j, …]；沿路定位节点后对它的 children 应用 fn
+        const idx = [];
+        for (let k = 1; k < path.length; k += 2) idx.push(path[k]);
+        let arr = groups;
+        for (let k = 0; k < idx.length - 1; k += 1) arr = arr[idx[k]].children;
+        const last = idx[idx.length - 1];
+        const node = idx.length > 1 ? arr[last] : null;
+        const target = idx.length > 1 ? node.children : arr;
+        fn(target);
+        return groups;
+      };
+      const rename = (path, name) => edit(g => { mutateAt(g, path, list => { list[path[path.length - 1]].name = name; }); });
+      const remove = (path) => edit(g => { mutateAt(g, path, list => list.splice(path[path.length - 1], 1)); });
+      const addChild = (path) => edit(g => { mutateAt(g, path, list => { list[path[path.length - 1]].children = (list[path[path.length - 1]].children || []).concat([{ name: '新目录', children: [] }]); }); });
+      const addTop = () => edit(g => { g.groups.push({ name: '新目录', children: [] }); });
+      const save = async () => {
+        setBusy(true);
+        try {
+          const r = await fetch(PREFIX + '/project/folders/template', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ template: tpl }) });
+          const d = await r.json().catch(() => ({}));
+          if (!r.ok || d.error) throw new Error(String(d.error || ('HTTP ' + r.status)));
+          setTpl(d.template); setSaved(d.template); setIsDefault(false);
+          if (onDirtyChange) onDirtyChange(false);
+          toast('文件夹模板已保存（' + countDirs(d.template) + ' 个目录）', 'ok');
+        } catch (e) { toast('保存失败：' + String((e && e.message) || e), 'danger'); }
+        setBusy(false);
+      };
+      const reset = async () => {
+        if (!confirm('恢复内置默认模板？当前模板会被清掉（已建好的项目目录不受影响）。')) return;
+        setBusy(true);
+        try {
+          const r = await fetch(PREFIX + '/project/folders/template', { method: 'DELETE' });
+          const d = await r.json().catch(() => ({}));
+          if (!r.ok || d.error) throw new Error(String(d.error || ('HTTP ' + r.status)));
+          setTpl(d.template); setSaved(d.template); setIsDefault(true);
+          if (onDirtyChange) onDirtyChange(false);
+          toast('已恢复内置默认模板', 'ok');
+        } catch (e) { toast('恢复默认失败：' + String((e && e.message) || e), 'danger'); }
+        setBusy(false);
+      };
+      const renderNode = (node, path, depth) => h('div', { key: path.join('.'), style: { marginLeft: depth ? 18 : 0 } },
+        h('div', { style: { display: 'flex', alignItems: 'center', gap: 6, padding: '3px 0' } },
+          h('span', { style: { fontSize: depth === 0 ? 13 : 12, fontWeight: depth === 0 ? 600 : 400, minWidth: 18 } }, depth === 0 ? '📁' : '└'),
+          h('input', {
+            className: 'pf-in', value: node.name, style: { width: Math.max(160, (node.name || '').length * 14 + 40) },
+            onChange: e => rename(path, e.target.value),
+          }),
+          h('button', { type: 'button', className: 'pf-btn sm', title: '在这下面加一层子目录', onClick: () => addChild(path), disabled: depth >= 4 }, '+ 子目录'),
+          h('button', { type: 'button', className: 'pf-btn sm', title: '删除这个目录（不影响已建好的目录）', onClick: () => { if (confirm('删除目录「' + node.name + '」及其子目录（只改模板，已存在的项目目录不会被删）？')) remove(path); } }, '删除'),
+        ),
+        (node.children || []).map((c, i) => renderNode(c, path.concat(['children', i]), depth + 1)));
+      const groups = tpl ? tpl.groups : [];
+      return h('div', null,
+        h('div', { className: 'wb-row', style: { justifyContent: 'space-between', marginBottom: 12 } },
+          h('div', null,
+            h('h2', { style: { margin: 0, fontSize: 18 } }, '文件夹模板'),
+            h('div', { className: 'wb-hint', style: { marginTop: 4 } },
+              '新建/绑定项目时按这棵树生成项目文件夹骨架。' + (dirty() ? '有未保存的修改。' : isDefault ? '当前为内置默认。' : '已保存自定义模板。')
+              + ' 各被评估单位的 00财务资料 / 02基础类 / 03资产基础法 / 04收益法 / 05市场法 子目录按公司与评估方法自动补齐，不在这棵树里。')),
+          h('div', { className: 'wb-row', style: { gap: 8 } },
+            h('button', { type: 'button', className: 'pf-btn', onClick: addTop, disabled: !tpl }, '+ 一级目录'),
+            h('button', { type: 'button', className: 'pf-btn', onClick: reset, disabled: busy }, '恢复默认'),
+            h('button', { type: 'button', className: 'pf-btn pri', onClick: save, disabled: busy || !tpl || !dirty() }, busy ? '保存中…' : '保存模板'))),
+        !tpl ? h('div', { className: 'wb-hint' }, busy ? '读取中…' : '模板加载失败，点「恢复默认」重建。')
+          : h('div', { style: { border: '1px solid var(--dsw-alias-border-l1,#ddd)', borderRadius: 10, padding: '10px 12px', maxHeight: '62vh', overflow: 'auto' } },
+            tpl.groups.length ? tpl.groups.map((g, i) => renderNode(g, ['groups', i], 0))
+              : h('div', { className: 'wb-hint' }, '模板是空的 —— 至少加一个一级目录再保存。')),
+        h('div', { className: 'wb-hint', style: { marginTop: 8 } },
+          '目录总数：' + countDirs(tpl) + '（上限 400，层级上限 5）。改模板只影响之后新建的项目文件夹；已经建好的项目目录不会被改动或删除。'));
+    }
+    function countDirs(t) {
+      if (!t || !Array.isArray(t.groups)) return 0;
+      let n = 0;
+      const walk = node => { n += 1; (node.children || []).forEach(walk); };
+      t.groups.forEach(walk);
+      return n;
+    }
+
+    // 天源项目「绑定文件夹」前的选择：新建本地文件夹（按模板生成一整套），还是绑定一个已经存在的文件夹。
     // 这个选择是用户明确要的「强关联」入口 —— 一进来就决定这个天源项目对应磁盘上哪个目录。
+    // 新建模式下的目录预览：与 folders.js 的 planProjectFolders 模板骨架对齐（各公司/方法子目录
+    // 会在填好被评估单位与评估方法后由 /project/folders/build 按需补齐，这里只展示固定骨架）。
+    const NEW_FOLDER_PREVIEW = [
+      { name: '01前期资料', children: ['参考资料', '待整理资料', '行业研究'] },
+      { name: '02现场资料', children: ['业务委托合同', '企业提供资料 / 00财务资料', '企业提供资料 / 01管理类', '企业提供资料 / 02基础类', '企业提供资料 / 03资产基础法', '企业提供资料 / 04收益法', '企业提供资料 / 05市场法', '现场勘察照片'] },
+      { name: '03评估底稿', children: ['一级复核 / 01-报告、说明、明细表', '一级复核 / 02-底稿', '一级复核 / 03-复核意见', '一级复核 / 04-财务报表、审定数据', '二级复核', '三级复核', '送签发', '管理类底稿'] },
+      { name: '04项目归档', children: ['01-报告、说明、明细表', '02-底稿', '03-复核意见', '04-财务报表、审定数据'] },
+    ];
+
     function TyImportDialog({ project, busy, onCancel, onConfirm, toast }) {
       const p = project || {};
-      const [mode, setMode] = useState('new');     // new=按编号简称新建 | bind=绑定已有目录
+      const [mode, setMode] = useState('new');     // new=按编号简称新建（模板整套目录） | bind=绑定已有目录
       const [abs, setAbs] = useState('');
       const [info, setInfo] = useState(null);
+      // 「新建」模式下的目录预览：优先取「文件夹模板」页保存的模板，取不到就用内置骨架兜底。
+      const [preview, setPreview] = useState(null);
+      useEffect(() => {
+        let gone = false;
+        (async () => {
+          try {
+            const r = await fetch(PREFIX + '/project/folders/template');
+            const d = await r.json().catch(() => ({}));
+            if (!gone && r.ok && d.ok && d.template && Array.isArray(d.template.groups)) setPreview(d.template.groups);
+          } catch (e) { /* 预览失败不拦导入 */ }
+        })();
+        return () => { gone = true; };
+      }, []);
+      const previewGroups = preview || NEW_FOLDER_PREVIEW.map(g => ({ name: g.name, children: g.children.map(c => ({ name: c })) }));
+      const renderPreviewNode = (node, depth) => h('div', { key: node.name + depth, style: { marginLeft: depth ? 16 : 0 } },
+        h('div', { style: { fontWeight: depth === 0 ? 600 : 400, fontSize: depth === 0 ? 12 : 11 } }, (depth === 0 ? '📁 ' : '└ ') + esc(node.name)),
+        (node.children || []).map(c => renderPreviewNode(c, depth + 1)));
       // p 是天源 MCP 的原始行（projectCode/projectName），不是本地记录（code/shortName）
       const autoName = folderNameOf({ code: p.projectCode, shortName: p.projectName });
       const probe = async v => {
@@ -4305,14 +4438,19 @@ window.__ModuleLoader__.load({
         probe(got);
       };
       const canOk = mode === 'new' || (!!String(abs).trim() && !!info && !info.error);
-      return h(Modal, { title: '导入天源项目 · ' + (p.projectName || '未命名'), onClose: busy ? () => {} : onCancel, style: { maxWidth: 700 } },
+      return h(Modal, { title: '绑定本地文件夹 · ' + (p.projectName || '未命名'), onClose: busy ? () => {} : onCancel, style: { maxWidth: 700 } },
         h('p', { className: 'pf-hint', style: { margin: '0 0 12px' } },
-          esc(p.projectCode || '无编号'), p.assessmentObject ? ' · ' + esc(p.assessmentObject) : '', ' · 链接后本地项目与天源项目一一对应，之后同步/打开都认这条关系。'),
+          esc(p.projectCode || '无编号'), p.assessmentObject ? ' · ' + esc(p.assessmentObject) : '', ' · 绑定后本地项目与天源项目一一对应，之后同步/打开都认这条关系。'),
         h('div', { className: 'wb-row', style: { gap: 8, marginBottom: 12 } },
           h('button', { type: 'button', className: 'pf-btn ' + (mode === 'new' ? 'pri' : ''), onClick: () => setMode('new') }, '新建本地文件夹'),
           h('button', { type: 'button', className: 'pf-btn ' + (mode === 'bind' ? 'pri' : ''), onClick: () => setMode('bind') }, '绑定已有文件夹')),
         mode === 'new'
-          ? h('div', { className: 'pf-hint' }, '会在项目根目录下按「编号 简称」新建：', h('code', null, autoName))
+          ? h('div', { className: 'pf-hint' },
+            h('div', { style: { marginBottom: 8 } }, '会在项目根目录下按「编号 简称」新建 ', h('code', null, autoName), '，并按项目模板生成一整套文件夹：'),
+            h('div', { style: { border: '1px solid var(--dsw-alias-border-l2,#ddd)', borderRadius: 8, padding: '8px 10px', fontSize: 12, maxHeight: 220, overflow: 'auto' } },
+              previewGroups.map(g => renderPreviewNode(g, 0))),
+            h('div', { style: { marginTop: 8, color: 'var(--dsw-alias-label-secondary,#777)' } },
+              '各被评估单位的 00财务资料 / 02基础类 / 03资产基础法 / 04收益法 / 05市场法 子目录，会在填好被评估单位与评估方法后自动补齐。'))
           : h('div', null,
             h('div', { className: 'pf-folder' },
               h('input', {
@@ -4334,7 +4472,7 @@ window.__ModuleLoader__.load({
           h('button', {
             type: 'button', className: 'pf-btn pri', disabled: !!busy || !canOk,
             onClick: () => onConfirm(mode === 'bind' ? { abs: String(abs).trim() } : {}),
-          }, busy ? '导入中…' : '确认导入')));
+          }, busy ? '绑定中…' : '确认绑定')));
     }
 
 
@@ -4903,14 +5041,14 @@ window.__ModuleLoader__.load({
             !merged.name && '项目名称', !merged.customer.name && '委托人名称', !merged.entity.name && '被评估单位',
           ].filter(Boolean);
           toast(
-            (existing ? '已更新：' : '已导入：') + (merged.name || '未命名')
+            (existing ? '已更新：' : '已绑定：') + (merged.name || '未命名')
             + ' · ' + groups.join('/') + ' 已同步'
             + (folder ? ' · 文件夹 ' + folder : (folderErr ? ' · 文件夹未建：' + folderErr : ''))
             + (empty.length ? ' · 天源这几项为空：' + empty.join('、') : ''),
             folderErr ? 'warn' : 'ok',
           );
         } catch (e) {
-          toast('导入失败：' + String((e && e.message) || e), 'danger');
+          toast('绑定文件夹失败：' + String((e && e.message) || e), 'danger');
         }
         setImporting('');
       };
@@ -4923,7 +5061,7 @@ window.__ModuleLoader__.load({
           h(Inp, { placeholder: '搜索项目 / 编号 / 部门', value: kw, onChange: e => setKw(e.target.value), style: { width: 190 } }),
           h(Btn, { variant: 'pri', onClick: syncNow, disabled: busy }, busy ? '同步中…' : '刷新同步'),
           h(Btn, { onClick: () => window.open(TY_BASE, '_blank', 'noopener') }, '打开天源')) },
-          h('p', { className: 'wb-hint', style: { marginTop: 0 } }, '数据来自天源 MCP（mcp.zhrdc.net/valuation-mcp）：共 ' + (rows ? rows.length : '—') + ' 个项目 · ' + syncedText + '。打开页面只显示上次保存到本机 localStorage 的副本，不会自动联网；点右上角「刷新同步」才拉取天源最新项目并覆盖保存到本地。点「导入」会让你选：按「项目编号 项目简称」新建本地文件夹，或直接绑定一个已经存在的本地文件夹 —— 选定之后，这个天源项目与那个目录一一对应，本地项目里的打开/底稿/归档都只认它。已导入的项目点名字直接进本地项目界面；要回天源网页，用行尾的「天源」按钮。已导入的再点「导入」就是「更新」，同步四组信息但不动本地工时与归档日。'),
+          h('p', { className: 'wb-hint', style: { marginTop: 0 } }, '数据来自天源 MCP（mcp.zhrdc.net/valuation-mcp）：共 ' + (rows ? rows.length : '—') + ' 个项目 · ' + syncedText + '。打开页面只显示上次保存到本机 localStorage 的副本，不会自动联网；点右上角「刷新同步」才拉取天源最新项目并覆盖保存到本地。点「绑定文件夹」会让你选：按「项目编号 项目简称」新建一整套项目文件夹（按模板），或直接绑定一个已经存在的本地文件夹 —— 选定之后，这个天源项目与那个目录一一对应，本地项目里的打开/底稿/归档都只认它。已绑定的项目点名字直接进本地项目界面；要回天源网页，用行尾的「天源」按钮。已绑定的再点「绑定文件夹」就是「更新」，同步四组信息但不动本地工时与归档日。'),
           dbg && h('div', { className: 'wb-alert danger', style: { marginBottom: 10 } }, h('div', { style: { flex: 1 } }, h('div', { className: 't' }, '最近一次同步失败'), h('div', { className: 'b' }, '本地已保存的数据未受影响。' + (tyMeta.cachedAt ? '可在「连接设置」检查授权后重试。' : '请先在「连接设置」完成授权。') + ' 错误：' + dbg))),
           !hasRows ? (busy ? Empty('正在同步并保存到本地…') : Empty('本地暂无项目数据，点右上角「刷新同步」拉取并保存')) : h(Table, { cols: ['项目编号 / 名称', '部门', '状态', '风险', '基准日', '人员', '操作'], rows: filtered.map(p => {
             const stt = TY_STATUS[Number(p.projectStatus)] || { t: '状态' + p.projectStatus, c: 'grey' };
@@ -4935,10 +5073,10 @@ window.__ModuleLoader__.load({
                 // 项目名称 → 进本地项目界面（不是跳天源）。没导入过的先提示导入。
                 h('div', null, h('div', {
                   className: imported ? 'pf-name' : 'pf-name muted',
-                  title: imported ? '进入项目界面（作业信息 / 股权信息 / 底稿目录）' : '这个项目还没导入本地，先点「导入」建好本地项目',
+                  title: imported ? '进入项目界面（作业信息 / 股权信息 / 底稿目录）' : '这个项目还没绑定本地文件夹，先点这一行的「绑定文件夹」',
                   onClick: () => {
                     if (imported) { if (onOpenProject) onOpenProject(localOne.id); return; }
-                    toast('「' + (p.projectName || '') + '」还没导入本地项目，先点这一行的「导入」', 'warn');
+                    toast('「' + (p.projectName || '') + '」还没绑定本地文件夹，先点这一行的「绑定文件夹」', 'warn');
                   },
                 }, h('b', null, esc(p.projectName)))),
                 h('div', { className: 'muted' }, esc(p.projectCode) + (p.assessmentObject ? ' · ' + esc(p.assessmentObject) : '')
@@ -4952,12 +5090,12 @@ window.__ModuleLoader__.load({
                 h(Btn, { className: 'sm', onClick: () => openDetail(p) }, '详情'),
                 h(Btn, {
                   className: 'sm', variant: imported ? '' : 'pri', disabled: importing === String(p.id),
-                  title: imported ? '从天源重新同步四组信息（本地工时与归档日不动）' : '选择导入方式：新建本地文件夹，或绑定一个已有的本地文件夹',
+                  title: imported ? '从天源重新同步四组信息（本地工时与归档日不动）' : '绑定本地文件夹：按模板新建一整套项目文件夹，或绑定一个已有的本地文件夹',
                   onClick: () => {
                     if (imported) return importProject(p);
                     setImportPick({ project: p });
                   },
-                }, importing === String(p.id) ? '导入中…' : (imported ? '更新' : '导入')),
+                }, importing === String(p.id) ? '绑定中…' : (imported ? '更新' : '绑定文件夹')),
                 imported
                   ? h(Btn, { className: 'sm', title: '在本地打开这个项目的目录', onClick: () => { if (onOpenProject) onOpenProject(localOne.id); } }, '打开')
                   : null,
@@ -9398,6 +9536,7 @@ window.__ModuleLoader__.load({
       const s = useStore();
       const [toastMsg, setToastMsg] = useState(null);
       const [reportDirty, setReportDirty] = useState(false);
+      const [foldersDirty, setFoldersDirty] = useState(false);
       const [compareDirty, setCompareDirty] = useState(false);
       const [sub, setSub] = useState({ work: 'projects', study: 'plans', stock: '' });
       // 浮动对话窗的开关。放在 WorkbenchPage 里而不是模块级，是为了跟随页签切换保留、
@@ -9418,6 +9557,8 @@ window.__ModuleLoader__.load({
       const go = (t, sb) => {
         if (tab === 'report-format' && t !== tab && reportDirty && !confirm('报告格式有未保存或未确认的修改，离开将丢失草稿，继续吗？')) return;
         if (tab === 'report-format' && t !== tab) setReportDirty(false);
+        if (tab === 'folder-template' && t !== tab && foldersDirty && !confirm('文件夹模板有未保存的修改，离开将丢失，继续吗？')) return;
+        if (tab === 'folder-template' && t !== tab) setFoldersDirty(false);
         if (tab === 'report-compare' && t !== tab) {
           if (compareDirty && !confirm('报告比对的差异结果还没写回，离开将丢失这次比对，继续吗？')) return;
           setCompareDirty(false);
@@ -9538,7 +9679,7 @@ window.__ModuleLoader__.load({
       const unread = s.alerts.filter(a => !a.read).length;
       // 页签精简（2026-11-18）：只保留 工作/文件库/设置；想恢复全部页签，
       // 用同目录 client.js.bak-fulltabs-* 覆盖回来，或把下面数组换回七项。
-      const tabs = [['work', '工作'], ['assistant', '助手'], ['library', '文件库'], ['report-format', '报告格式'], ['report-compare', '报告比对'], ['data-tools', '数据工具'], ['land-market', '土地市场法'], ['settings', '设置']];
+      const tabs = [['work', '工作'], ['assistant', '助手'], ['library', '文件库'], ['report-format', '报告格式'], ['report-compare', '报告比对'], ['data-tools', '数据工具'], ['land-market', '土地市场法'], ['folder-template', '文件夹模板'], ['settings', '设置']];
       return h('div', { className: 'wb-root' }, h(StyleTag, null), h('div', { className: 'wb-wrap' },
         h('h1', { className: 'wb-h1' }, '个人工作台'),
         h('p', { className: 'wb-sub' }, '资产评估项目管理 — ' + todayStr()),
@@ -9551,6 +9692,7 @@ window.__ModuleLoader__.load({
           tab === 'report-compare' ? h(ReportComparePage, { s, toast, onDirtyChange: setCompareDirty }) :
           tab === 'data-tools' ? h(DataTools, { toast }) :
           tab === 'land-market' ? h(LandMarketPanel) :
+          tab === 'folder-template' ? h(FolderTemplatePage, { toast, onDirtyChange: setFoldersDirty }) :
           tab === 'study' ? h(Study, { s, sub: sub.study, toast, go }) :
           tab === 'stock' ? h(Stock, { s, toast, refresh }) :
           tab === 'alerts' ? h(Alerts, { s }) : h(Settings, { s, toast }),
