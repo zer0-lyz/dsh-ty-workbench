@@ -70,7 +70,7 @@ export async function startLogin(credentialName) {
     const err = u.searchParams.get('error');
     const send = (ok, msg) => {
       res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
-      res.end('<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><title>天源授权</title><style>body{min-height:100vh;margin:0;display:grid;place-items:center;background:#f5f7fb;color:#16182f;font-family:"Microsoft YaHei UI",Arial,sans-serif}main{width:min(440px,90vw);padding:30px;border-radius:16px;background:#fff;box-shadow:0 18px 60px rgba(22,24,47,.12);text-align:center}h1{font-size:22px}p{color:#667085;line-height:1.7}</style></head><body><main><h1>' + (ok ? '授权完成' : '授权未完成') + '</h1><p>' + msg + '。可关闭此页，回到个人工作台。</p></main></body></html>');
+      res.end('<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><title>天源授权</title><style>body{min-height:100vh;margin:0;display:grid;place-items:center;background:#f5f7fb;color:#16182f;font-family:"Microsoft YaHei UI",Arial,sans-serif}main{width:min(440px,90vw);padding:30px;border-radius:16px;background:#fff;box-shadow:0 18px 60px rgba(22,24,47,.12);text-align:center}h1{font-size:22px}p{color:#667085;line-height:1.7}</style></head><body><main><h1>' + (ok ? '授权完成' : '授权未完成') + '</h1><p>' + msg + '。可关闭此页，回到 个人工作台。</p></main></body></html>');
     };
     if (err) { send(false, '错误：' + err); return; }
     if (got !== state || !code) { send(false, 'state 不匹配或缺少 code'); return; }

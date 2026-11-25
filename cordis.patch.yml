@@ -1,4 +1,4 @@
 - insert:
     - id: workbench
-      name: '@zer0_y/dsh-ty-workbench'
+      name: '@local/dsh-ty-workbench'
       config: {}

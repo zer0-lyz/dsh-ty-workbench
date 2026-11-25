@@ -1,5 +1,5 @@
 window.__ModuleLoader__.load({
-  id: '@zer0_y/dsh-ty-workbench',
+  id: '@local/dsh-ty-workbench',
   factory(require) {
     const React = require('react');
     const h = React.createElement;
@@ -802,7 +802,46 @@ window.__ModuleLoader__.load({
     const DEFAULT_SIGNER1 = '经理A';
     const DEFAULT_SIGNER2 = '合伙人A';
     const CONTRACT_TYPES = ['框架协议', '非框架协议'];
-    const CURRENCIES = ['人民币', '美元', '欧元', '港币', '日元'];
+    // 合同币种：按 IMF/央行统计口径的常见币种铺开（ECB 参考汇率覆盖的 30 种 + IMF 名单里其余常用的）。
+    // 括号里是 ECB 三字母码；没有码的那些 ECB 不发布参考汇率 → 只能手填汇率，界面上会提示。
+    const CURRENCIES = [
+      '人民币',
+      '美元', '欧元', '英镑', '日元', '港币',
+      '澳元', '加拿大元', '瑞士法郎', '新西兰元', '新加坡元',
+      '韩元', '印度卢比', '印尼盾', '马来西亚林吉特', '菲律宾比索', '泰铢',
+      '越南盾', '巴基斯坦卢比', '孟加拉塔卡', '斯里兰卡卢比', '尼泊尔卢比', '蒙古图格里克',
+      '俄罗斯卢布', '哈萨克斯坦坚戈', '土耳其里拉', '以色列谢克尔',
+      '沙特里亚尔', '阿联酋迪拉姆', '卡塔尔里亚尔', '科威特第纳尔', '巴林第纳尔', '阿曼里亚尔',
+      '南非兰特', '埃及镑', '尼日利亚奈拉', '肯尼亚先令', '摩洛哥迪拉姆',
+      '巴西雷亚尔', '墨西哥比索', '阿根廷比索', '智利比索', '哥伦比亚比索', '秘鲁索尔',
+      '捷克克朗', '波兰兹罗提', '匈牙利福林', '罗马尼亚列伊', '保加利亚列弗',
+      '瑞典克朗', '挪威克朗', '丹麦克朗', '冰岛克朗', '塞尔维亚第纳尔', '乌克兰格里夫纳',
+    ];
+    // 币种 → ECB 三字母码。表里有码的能按基准日自动取官方汇率；没有的只能手填。
+    const CURRENCY_CODES = {
+      人民币: 'CNY', 美元: 'USD', 欧元: 'EUR', 英镑: 'GBP', 日元: 'JPY', 港币: 'HKD',
+      澳元: 'AUD', 加拿大元: 'CAD', 瑞士法郎: 'CHF', 新西兰元: 'NZD', 新加坡元: 'SGD',
+      韩元: 'KRW', 印度卢比: 'INR', 印尼盾: 'IDR', 马来西亚林吉特: 'MYR', 菲律宾比索: 'PHP', 泰铢: 'THB',
+      以色列谢克尔: 'ILS',
+      南非兰特: 'ZAR',
+      巴西雷亚尔: 'BRL', 墨西哥比索: 'MXN',
+      捷克克朗: 'CZK', 波兰兹罗提: 'PLN', 匈牙利福林: 'HUF', 罗马尼亚列伊: 'RON',
+      瑞典克朗: 'SEK', 挪威克朗: 'NOK', 丹麦克朗: 'DKK', 冰岛克朗: 'ISK',
+      土耳其里拉: 'TRY',
+    };
+    // 汇率：合同金额 = 合同原币金额 × 汇率（人民币 = 1）。
+    // 估出来的是「折算参考值」，实际结算按合同约定的锁定汇率，所以表单里可手改，
+    // 合同金额始终 = 原币金额 × 该汇率，自动重算，不做手填。
+    // 汇率兜底值：网络取不到官方汇率时才用（约 2026 年中的水平，只为让金额算得出来，不追求精确）。
+    // 能联网时一律以基准日的 ECB 参考汇率为准，这张表只做 rear guard。
+    const FX_RATES = {
+      人民币: 1, 美元: 6.67, 欧元: 7.35, 英镑: 8.8, 日元: 0.042, 港币: 0.85,
+      澳元: 4.5, 加拿大元: 4.9, 瑞士法郎: 7.6, 新西兰元: 4.1, 新加坡元: 5.1,
+      韩元: 0.0049, 印度卢比: 0.079, 印尼盾: 0.00042, 马来西亚林吉特: 1.5, 菲律宾比索: 0.115, 泰铢: 0.195,
+      以色列谢克尔: 1.8, 南非兰特: 0.36, 巴西雷亚尔: 1.2, 墨西哥比索: 0.36,
+      捷克克朗: 0.3, 波兰兹罗提: 1.7, 匈牙利福林: 0.018, 罗马尼亚列伊: 1.48,
+      瑞典克朗: 0.63, 挪威克朗: 0.62, 丹麦克朗: 0.985, 冰岛克朗: 0.048, 土耳其里拉: 0.19,
+    };
     const PAY_METHODS = ['一次性支付', '分期支付', '按进度支付'];
     const SUBMIT_WAYS = ['特快专递', '电子邮件', '现场领取', '邮寄'];
     const ENTITY_TYPES = ['有限责任公司', '股份有限公司', '国有企业', '外商投资企业', '合伙企业', '个人独资企业', '其他'];
@@ -954,7 +993,7 @@ window.__ModuleLoader__.load({
         customers: [emptyCustomer()],
         purposeOther: '',
         entity: { name: '', shortName: '', legalRep: '', creditCode: '', entType: '', capital: '', address: '', business: '', intro: '' },
-        contract: { type: '', signDate: '', serviceStart: '', serviceEnd: '', currency: '人民币', amountOriginal: '', amount: '', payMethod: '', reportSubmitAt: '', reportSubmitWay: '特快专递', reportCopies: '4', statementCopies: '4', otherUsers: DEFAULT_REPORT_USERS, purposeDetail: '', attachment: '', attachmentPath: '', markdownPath: '', secret: '' },
+        contract: { type: '', signDate: '', serviceStart: '', serviceEnd: '', currency: '人民币', fxRate: '1', fxDate: '', fxRateTouched: false, amountOriginal: '', amount: '', payMethod: '', reportSubmitAt: '', reportSubmitWay: '特快专递', reportCopies: '4', statementCopies: '4', otherUsers: DEFAULT_REPORT_USERS, purposeDetail: '', attachment: '', attachmentPath: '', markdownPath: '', secret: '' },
         tyId: '',
         tyUrl: TY_BASE,
         // 绑定的本地文件夹（绝对路径）。空 = 没绑定，按「项目根 + 编号 简称」自动找/建；
@@ -1017,6 +1056,11 @@ window.__ModuleLoader__.load({
       });
       // 服务期间起止日 = 合同签订日 ~ 归档日（没填过就按这两个日期带出来）
       const contract = { ...base.contract, ...(src.contract || {}) };
+      // 汇率：老数据没有 fxRate，按币种补默认值；空串也补
+      if (String(contract.fxRate == null ? '' : contract.fxRate).trim() === '') {
+        const r = FX_RATES[String(contract.currency || '人民币').trim()];
+        contract.fxRate = String(r == null ? 1 : r);
+      }
       // 其他报告使用人空着就按默认值补（老数据也一样）
       if (!String(contract.otherUsers || '').trim()) contract.otherUsers = DEFAULT_REPORT_USERS;
       if (!String(contract.reportSubmitWay || '').trim()) contract.reportSubmitWay = '特快专递';
@@ -1059,6 +1103,41 @@ window.__ModuleLoader__.load({
         const { updatedAt, ...rest } = rec || {};
         return JSON.stringify(rest);
       } catch (e) { return ''; }
+    }
+
+    // 汇率：传币种名或数字都行，返回数字；认不出来返回 null
+    function toRate(v) {
+      const s = String(v == null ? '' : v).trim();
+      if (!s) return null;
+      const n = Number(s);
+      if (isFinite(n) && n > 0) return n;
+      return Object.prototype.hasOwnProperty.call(FX_RATES, s) ? FX_RATES[s] : null;
+    }
+
+    // 合同金额 = 原币金额 × 汇率（折人民币），**始终由公式推导**，不再保留「手填值」。
+    //
+    // 之前有个 amountTouched 保护：用户动过合同金额就不再自动覆盖。
+    // 实践下来是错的——切换币种（人民币→港币）时合同金额还停在原币数字上（100,000 元），
+    // 看着像"没乘汇率"，实际是被那个标记挡住了。既然金额本来就是算出来的，
+    // 就让它纯粹是结果：改原币金额/币种/汇率都重算，用户不需要也不应该手改它。
+    function computeContractAmount(next) {
+      const k = (next && next.contract) || {};
+      const raw = String(k.amountOriginal == null ? '' : k.amountOriginal).replace(/[,\s]/g, '');
+      if (!raw) return next;
+      const m = raw.match(/([0-9]+(?:\.[0-9]+)?)\s*(亿元|亿|万元|万|元)?/);
+      if (!m) return next;
+      let n = Number(m[1]);
+      if (!isFinite(n)) return next;
+      const unit = m[2] || '';
+      if (unit === '亿' || unit === '亿元') n = n * 100000000;
+      else if (unit === '万' || unit === '万元') n = n * 10000;
+      const rate = toRate(k.fxRate != null && String(k.fxRate).trim() !== '' ? k.fxRate : k.currency);
+      if (rate == null) return next;
+      const yuan = Math.round(n * rate * 100) / 100;
+      // 记下这次折算用的汇率/日期，方便回头核对是哪个基准日、哪个源
+      // 金额只存数字（单位由「合同币种」决定）：以前这里拼了「元」，同步到天源时
+      // 「合同金额」那一栏只收数字，于是回读永远对不上「100,000 元」vs「100,000.00」。
+      return { ...next, contract: { ...next.contract, amount: formatCapital(yuan.toFixed(2)), amountFxRate: String(rate), amountFxDate: String(k.fxDate || '') } };
     }
 
     // 把合同里的金额换成「元 + 千分位」：28万元 → 280,000 元；280000 → 280,000 元
@@ -1221,6 +1300,8 @@ window.__ModuleLoader__.load({
     function ProjectForm({ project, projects, companies, parseModel, onBack, onSave, toast }) {
       const [f, setF] = useState(() => (project ? normalizeProject(project) : newProject(projects)));
       const [tab, setTab] = useState('basic');
+      const [fx, setFx] = useState(null);          // { date, base, rates:{CNY:6.66,...}, source } | { error }
+      const [fxBusy, setFxBusy] = useState(false);
       const [upOpen, setUpOpen] = useState(false);   // 「同步到线上」清单弹窗
       const [upBusy, setUpBusy] = useState(false);   // 自动填表进行中
       const [upRes, setUpRes] = useState(null);      // 自动填表结果
@@ -1282,8 +1363,55 @@ window.__ModuleLoader__.load({
         }
         return next;
       };
+      // 从汇率表里取「1 单位该币种 = 多少人民币」
+      // ECB 以 USD 为基准：rates[X] 表示 1 USD = X 单位 X 币，所以 1 X 币 = rates.CNY / rates[X]
+      const rateFromFx = (cur) => {
+        const name = String(cur || '人民币').trim();
+        if (name === '人民币' || !name) return 1;
+        const code = CURRENCY_CODES[name];
+        if (!code) return null;                       // 该币种 ECB 不发布参考汇率 → 手填
+        if (!fx || !fx.rates) return null;
+        if (code === 'USD') return Number(fx.rates.CNY) || null;
+        const r = Number(fx.rates[code]) || 0;
+        const cny = Number(fx.rates.CNY) || 0;
+        if (!r || !cny) return null;
+        return Math.round((cny / r) * 1e6) / 1e6;   // 6 位小数够用，避免 0.04208400000001 这种尾巴
+      };
+      // 该币种能不能自动取汇率（界面上用来决定提示语）
+      const fxSupported = (cur) => {
+        const name = String(cur || '人民币').trim();
+        return name === '人民币' || !!CURRENCY_CODES[name];
+      };
+
       const setPath = (path, value) => setF(prev => {
         let next = setIn(prev, path, value);
+        // 合同金额 = 合同原币金额 × 汇率（折人民币），永远是算出来的结果。
+        // 触发点：改原币金额 / 改币种 / 改汇率 / 重新取到汇率，任一处变化都重算。
+        if (path === 'contract.amount') {
+          // 合同金额本身不接受手改（界面上也做成只读），直接按公式覆盖回去
+          next = computeContractAmount(next);
+        } else if (path === 'contract.amountOriginal') {
+          next = computeContractAmount(next);
+        } else if (path === 'contract.currency' || path === 'contract.fxRate') {
+          // 换币种时优先用「基准日官方汇率」覆盖 fxRate，取不到才退回内置参考值
+          if (path === 'contract.currency') {
+            const official = rateFromFx(value);
+            const r = official != null ? official : toRate(value);
+            if (r != null) next.contract = { ...next.contract, fxRate: String(r), fxDate: (fx && fx.date) || '', fxRateTouched: false };
+          } else {
+            // 手动改汇率：记一笔，之后自动取回的官方汇率不再覆盖它
+            next.contract = { ...next.contract, fxRateTouched: String(value == null ? '' : value).trim() !== '' };
+          }
+          next = computeContractAmount(next);
+        }
+        // 改评估基准日：日期一变，汇率要跟着重取（这里先按已拿到的汇率重算，useEffect 会再拉最新的）
+        // 合同签订日变化 → 汇率日期跟着变（签约日优先，没填才用基准日），先按已拿到的汇率重算，
+        // useEffect 会再按新日期拉一次最新汇率
+        if (path === 'contract.signDate' || path === 'baseDate') {
+          const official = rateFromFx((next.contract || {}).currency);
+          if (official != null) next.contract = { ...next.contract, fxRate: String(official), fxDate: (fx && fx.date) || '' };
+          next = computeContractAmount(next);
+        }
         // 评估报告日 → 归档日（默认 +90 天）：归档日还空着、或正好是「旧报告日 + 90」时才自动跟
         if (path === 'reportDate') {
           const prevAuto = datePlus(prev.reportDate, 90);
@@ -1469,6 +1597,67 @@ window.__ModuleLoader__.load({
           boundAbs ? h('button', { type: 'button', className: 'pf-btn danger', disabled: !!bindBusy, title: '只解除关联，磁盘上的文件一个都不动', onClick: () => setF(prev => ({ ...prev, folderPath: '', folderBoundAt: '' })) }, '解除绑定') : null,
           boundAbs ? h('span', { className: 'pf-hint' }, '已绑定到自定义目录') : h('span', { className: 'pf-hint' }, '未绑定 · 保存时自动创建：' + folderNameOf(f))), 3)],
       ];
+      // 汇率取哪一天：优先「合同签订日期」，没填就用「评估基准日」兜底。
+      // 合同金额是折算成人民币的，按签约当天的汇率更符合实际结算口径。
+      const fxDateOf = (state) => {
+        const k = (state && state.contract) || {};
+        const sign = String(k.signDate || '').slice(0, 10);
+        if (/^\d{4}-\d{2}-\d{2}$/.test(sign)) return { date: sign, by: '合同签订日' };
+        const base = String((state && state.baseDate) || '').slice(0, 10);
+        if (/^\d{4}-\d{2}-\d{2}$/.test(base)) return { date: base, by: '评估基准日' };
+        return { date: '', by: '' };
+      };
+      // 按该日期取当天官方参考汇率（宿主 /fx → ECB）。日期变了就重取一次。
+      // 拿不到不报错，界面显示「汇率未取到，可手填」——汇率只是折算参考，不该挡住填表。
+      const fetchFx = async (date) => {
+        const d = String(date || '').slice(0, 10);
+        if (!/^\d{4}-\d{2}-\d{2}$/.test(d)) { setFx(null); return; }
+        setFxBusy(true);
+        try {
+          const r = await fetch(PREFIX + '/fx?date=' + d + '&base=USD');
+          const j = await r.json().catch(() => null);
+          setFx(j && j.ok ? j : { error: (j && (j.error || j.msg)) || ('HTTP ' + r.status) });
+        } catch (e) {
+          setFx({ error: String((e && e.message) || e) });
+        } finally {
+          setFxBusy(false);
+        }
+      };
+      // 合同签订日（没填则评估基准日）变化时重取
+      useEffect(() => {
+        const d = fxDateOf(f).date;
+        if (!/^\d{4}-\d{2}-\d{2}$/.test(d)) return;
+        let live = true;
+        (async () => {
+          setFxBusy(true);
+          try {
+            const r = await fetch(PREFIX + '/fx?date=' + d + '&base=USD');
+            const j = await r.json().catch(() => null);
+            if (live) setFx(j && j.ok ? j : { error: (j && (j.error || j.msg)) || ('HTTP ' + r.status) });
+          } catch (e) {
+            if (live) setFx({ error: String((e && e.message) || e) });
+          } finally {
+            if (live) setFxBusy(false);
+          }
+        })();
+        return () => { live = false; };
+      }, [f && f.contract && f.contract.signDate, f && f.baseDate]);
+
+      // 汇率取回来后，用它刷新币种对应的 fxRate 并重算合同金额。
+      // 汇率被手改过（fxRateTouched）就不动它；金额本身没有「手改」概念，永远跟着公式走。
+      useEffect(() => {
+        if (!fx || !fx.rates) return;
+        const cur = String((f.contract || {}).currency || '人民币');
+        const official = rateFromFx(cur);
+        if (official == null) return;
+        setF(prev => {
+          const pk = prev.contract || {};
+          if (pk.fxRateTouched) return prev;          // 手改过汇率就完全尊重手填
+          let next = { ...prev, contract: { ...pk, fxRate: String(official), fxDate: fx.date || '' } };
+          next = computeContractAmount(next);
+          return next;
+        });
+      }, [fx && fx.date, fx && fx.rates && fx.rates.CNY]);
 
       // 打开「合同信息」时先看看文件夹里已经有什么：有合同就自动带出来，有 md 就自动认出来
       const detectContractFiles = async () => {
@@ -2093,7 +2282,49 @@ window.__ModuleLoader__.load({
       const contractRows = [
         [L('合同类型'), V(sel('contract.type', CONTRACT_TYPES, '请选择合同类型')), L('合同签订日期'), V(dte('contract.signDate'))],
         [L('服务期间起止日'), V(h('div', { className: 'pf-2' }, dte('contract.serviceStart'), h('span', { className: 'pf-unit' }, '至'), dte('contract.serviceEnd'))), L('合同币种'), V(sel('contract.currency', CURRENCIES, '请选择合同币种'))],
-        [L('合同原币金额'), V(capInp('contract.amountOriginal', { placeholder: '如：280,000' })), L('合同金额'), V(h('div', { className: 'pf-2' }, capInp('contract.amount', { placeholder: '如：280,000 元' })))],
+        [L('合同原币金额'), V(capInp('contract.amountOriginal', { placeholder: '如：280,000' })),
+          L('合同金额'), V(h('div', { className: 'pf-2', style: { flexWrap: 'nowrap', minWidth: 0 } },
+            // 合同金额是「原币金额 × 汇率」的结果，不做手填：只读展示，改算法就改原币或汇率
+            // 值里存的是「100,000 元」，但框内只显示数字，单位用右侧 .pf-unit 呈现——
+            // 否则输入框被压缩时「元」会贴着边框、看起来像露在框外。
+            h('input', {
+              className: 'pf-in',
+              readOnly: true,
+              value: String(getVal('contract.amount') == null ? '' : getVal('contract.amount')).replace(/\s*元\s*$/, ''),
+              placeholder: '原币 × 汇率自动算出',
+              title: '合同金额 = 合同原币金额 × 汇率（折人民币），自动计算\n要改请改左侧「合同原币金额」或右侧汇率',
+              style: { flex: '1 1 auto', minWidth: 0, background: 'var(--dsw-alias-bg-layer-2,#f7f8fa)', cursor: 'default', color: 'var(--dsw-alias-label-secondary,#666)' },
+            }),
+            h('span', { className: 'pf-unit', style: { flex: '0 0 auto' } }, '元'),
+            h('span', { className: 'pf-unit', style: { flex: '0 0 auto' }, title: '汇率来自基准日官方参考汇率（ECB），可手改；改了就按你填的算' },
+              h('span', { style: { marginRight: 2 } }, '×'),
+              h('input', {
+                className: 'pf-in',
+                style: { width: 44, padding: '2px 2px', textAlign: 'right', fontSize: 12 },
+                value: getVal('contract.fxRate') == null || getVal('contract.fxRate') === ''
+                  ? String(toRate(getVal('contract.currency')) == null ? '' : toRate(getVal('contract.currency')))
+                  : getVal('contract.fxRate'),
+                title: '汇率（1 ' + (getVal('contract.currency') || '人民币') + ' 折人民币）'
+                  + (fx && fx.rates
+                    ? '\n按' + (fxDateOf(f).by || '日期') + ' ' + (fxDateOf(f).date || '—') + ' 取的官方参考汇率'
+                      + '\n用到的日期 ' + fx.date + '（' + (fx.source || 'ECB') + '）'
+                      + (fxDateOf(f).by === '评估基准日' ? '\n（合同签订日期没填，退回按基准日）' : '')
+                    : !fxSupported(getVal('contract.currency')) ? '\n该币种无官方参考汇率，请手填'
+                      : '\n可手填'),
+                onChange: e => setPath('contract.fxRate', e.target.value),
+              })),
+            h('button', {
+              type: 'button', className: 'pf-mini',
+              // 同高同圆角（pf-in 是 height:30 / radius:2）；flex:0 0 auto 保证不被压缩也不外溢
+              style: { height: 30, lineHeight: '28px', borderRadius: 2, padding: '0 6px', flex: '0 0 auto', alignSelf: 'center' },
+              disabled: fxBusy,
+              title: fxBusy ? '正在取汇率…'
+                : fx && fx.rates ? '重新取官方参考汇率（ECB）\n当前：' + fx.date + '（按' + (fxDateOf(f).by || '日期') + '）'
+                  : '按合同签订日期取官方参考汇率（ECB）',
+              onClick: async () => {
+                await fetchFx(fxDateOf(f).date);
+              },
+            }, fxBusy ? '…' : '取汇率')) )],
         [L('评估费支付方式'), V(inp('contract.payMethod', { placeholder: '请输入评估费支付方式' })), L('报告提交时间'), V(dte('contract.reportSubmitAt'))],
         [L('报告提交方式'), V(sel('contract.reportSubmitWay', SUBMIT_WAYS, '请选择报告提交方式')), L('外送报告份数'), V(nmb('contract.reportCopies', { min: '0', step: '1', placeholder: '0' }))],
         [L('外送评估说明份数'), V(nmb('contract.statementCopies', { min: '0', step: '1', placeholder: '0' })), L('其他报告使用人'), V(inp('contract.otherUsers', { placeholder: '如：法律、行政法规规定的使用人' }))],
@@ -3947,6 +4178,7 @@ window.__ModuleLoader__.load({
       const loginCli = async () => {
         try {
           const d = await api('/ty/cli/login', { method: 'POST' }); setCliStatus(d);
+          if (!d.installed) { toast(d.reason || '未找到 tycpv，请先安装天源 CLI', 'warn'); return; }
           if (d.state === 'authenticated') toast('检测到 CLI 已有本地凭据；如需切换账号，请先在终端退出 CLI 登录', 'info');
           else { setCliWaiting(true); toast('正在启动 CLI 授权，请在浏览器中完成登录'); }
         } catch (e) { toast('启动 CLI 授权失败：' + e.message, 'danger'); }
@@ -4022,8 +4254,43 @@ window.__ModuleLoader__.load({
         ),
         h('div', { className: 'wb-alert ' + (cliStatus?.authenticated && cliStatus.state !== 'failed' ? '' : 'warn'), style: { marginTop: 10 } },
           h('div', { style: { flex: 1 } },
-            h('div', { className: 't', role: 'status' }, 'CLI 状态：' + (!cliStatus ? '正在检查…' : cliStatus.state === 'starting' ? '正在启动授权…' : cliStatus.state === 'waiting' ? '等待浏览器授权…' : cliStatus.state === 'failed' ? '授权未完成' : cliStatus.state === 'error' ? '状态检查失败' : !cliStatus.installed ? '未在候选路径找到 CLI' : cliStatus.authenticated ? '检测到本地凭据' : cliStatus.expiresAt && Date.parse(cliStatus.expiresAt) <= Date.now() ? '本地凭据已过期' : '未检测到可用本地凭据')),
-            h('div', { className: 'b' }, cliStatus?.reason || (cliStatus?.authenticated ? '本地凭据可读取；远端有效性仍需实际调用验证。' : 'CLI 与 MCP 分别授权；点击「授权 CLI」完成浏览器登录。')),
+            h('div', { className: 't', role: 'status' }, 'CLI 状态：' + (!cliStatus ? '正在检查…'
+              : cliStatus.state === 'starting' ? '正在启动授权…'
+              : cliStatus.state === 'waiting' ? '等待浏览器授权…'
+              : cliStatus.state === 'failed' ? '授权未完成'
+              : cliStatus.state === 'error' ? '状态检查失败'
+              : !cliStatus.installed ? '未找到 tycpv CLI'
+              : cliStatus.authenticated ? '本地凭据有效'
+              : cliStatus.expired ? '本地凭据已过期'
+              : '未检测到可用本地凭据')),
+            // 装上了就报出实际路径与账号，装不上时说清查过哪些位置——不再只给一句"未找到"。
+            h('div', { className: 'b' }, cliStatus?.reason
+              || (cliStatus
+                ? cliStatus.installed
+                  ? 'tycpv：' + (cliStatus.binPath || '已找到')
+                    + (cliStatus.account ? ' · 账号 ' + cliStatus.account : '')
+                    + (cliStatus.expiresAt ? ' · 有效期至 ' + String(cliStatus.expiresAt).slice(0, 16).replace('T', ' ') : '')
+                    + (cliStatus.authenticated ? '；远端有效性仍需实际调用验证。' : '；点「授权 CLI」重新登录。')
+                  : '未找到 tycpv（已检查 TYCPV_BIN、常见安装目录与 PATH）。可在终端运行 tycpv login 确认已安装。'
+                : 'CLI 与 MCP 分别授权；点击「授权 CLI」完成浏览器登录。')),
+          ),
+        ),
+        // tycpv 会自己打开浏览器；这段只在它没打开时给用户一个可点的入口，避免卡在「等待浏览器授权」。
+        cliStatus?.authUrl && !cliStatus.authenticated && h('div', { className: 'wb-alert warn', style: { marginTop: 10, display: 'block' } },
+          h('div', { className: 't', style: { marginBottom: 6 } }, 'CLI 授权页已打开'),
+          h('div', { className: 'b', style: { marginBottom: 8 } }, 'tycpv 通常会自动打开浏览器；若没弹出，点「打开 CLI 授权页」用系统浏览器打开。完成登录后本页会自动变成「本地凭据有效」。'),
+          h('div', { className: 'wb-row' },
+            h('a', { className: 'wb-link', href: cliStatus.authUrl, target: '_blank', rel: 'noopener', style: { wordBreak: 'break-all', flex: 1, fontSize: 11 } }, cliStatus.authUrl),
+            h(Btn, { className: 'sm', variant: 'pri', onClick: async () => {
+              const r = await openInApp(cliStatus.authUrl);
+              if (r === 'system') toast('已用系统浏览器打开 CLI 授权页');
+              else if (r === 'sidebar') toast('已在右侧栏打开 CLI 授权页');
+              else toast('无法自动打开，请手动复制链接到浏览器', 'warn');
+            } }, '打开 CLI 授权页'),
+            h(Btn, { className: 'sm', onClick: async () => {
+              try { await navigator.clipboard.writeText(cliStatus.authUrl); toast('CLI 授权链接已复制', 'ok'); }
+              catch (e) { toast('复制失败，请手动选中链接', 'warn'); }
+            } }, '复制链接'),
           ),
         ),
         h('div', { className: 'wb-row', style: { marginTop: 10 } },
@@ -6358,7 +6625,7 @@ window.__ModuleLoader__.load({
       ['tushare', 'Tushare · tushareMcp'],
       ['baostock', 'Baostock'],
       ['efinance', 'efinance'],
-      ['tencent', '腾讯行情 · 备用'],
+      ['tencent', '腾讯行情'],
     ];
     const STOCK_RANGES = [[60, '60 根'], [120, '120 根'], [250, '250 根'], [0, '全部']];
     const CHART_DAYS = 1600;   // 图表一次取最近约 6.3 年，缩放/平移都在这段里
@@ -6697,7 +6964,8 @@ window.__ModuleLoader__.load({
         if (watchKey === pushed.current) return;
         const t = setTimeout(async () => {
           try {
-            await stockPost('/watchlist', { items: sk.watch.map(x => ({ code: x.code, name: x.name, market: x.market, cost: Number(x.cost) || 0, shares: Number(x.shares) || 0, note: x.note || '' })) });
+            // purgeMissing：让 worker 把「已不在自选」的股票日线一并清掉（服务端还要求列表非空）
+            await stockPost('/watchlist', { purgeMissing: true, items: sk.watch.map(x => ({ code: x.code, name: x.name, market: x.market, cost: Number(x.cost) || 0, shares: Number(x.shares) || 0, note: x.note || '' })) });
             pushed.current = watchKey;
           } catch (e) { /* 宿主未加载股票 bundle 时静默，不打扰界面 */ }
         }, 700);
@@ -6803,7 +7071,44 @@ window.__ModuleLoader__.load({
       };
       const saveAlert = f => patch('stock', st => ({ ...st, watch: st.watch.map(x => x.id === f.id ? f : x) }));
       const saveHold = f => patch('stock', st => ({ ...st, watch: st.watch.map(x => x.id === f.id ? { ...x, cost: f.cost, shares: f.shares } : x) }));
-      const del = id => { if (confirm('从自选股移除？')) patch('stock', st => ({ ...st, watch: st.watch.filter(x => x.id !== id) })); };
+      // 删除自选股时连本地库一起清：只删自选行会留下孤儿日线，数据库表格里还挂着这只股票
+      const watchPayload = () => sk.watch.map(x => ({ code: x.code, name: x.name, market: x.market, cost: Number(x.cost) || 0, shares: Number(x.shares) || 0, note: x.note || '' }));
+      const purgeStockQuiet = async code => {
+        if (!code) return;
+        try {
+          await stockPost('/purge', { codes: [code], keepWatch: true });
+          toast('已删除 ' + code + ' 的日线数据', 'ok');
+        } catch (e) {
+          // 宿主半侧的 /purge 是新加路由；宿主模块没重新加载时会 404。
+          // 退路：借已有的 /watchlist 覆盖保存触发级联清理，再把这只股票写回自选行 —— 效果一样，不用重启。
+          const m = String((e && e.message) || e);
+          if (!/40[45]|未找到|not found|HTTP 40/i.test(m)) { toast('删除日线失败：' + m, 'danger'); loadDb(); return; }
+          try {
+            const all = watchPayload();
+            await stockPost('/watchlist', { purgeMissing: true, items: all.filter(x => x.code !== code) });
+            await stockPost('/watchlist', { items: all });
+            toast('已删除 ' + code + ' 的日线数据（重启 DSH 后可走直连接口）', 'ok');
+          } catch (e2) {
+            toast('删除日线失败：' + ((e2 && e2.message) || e2) + '（重启 DSH 后重试）', 'danger');
+          }
+        }
+        loadDb();
+      };
+      const purgeStock = async (code, name) => {
+        if (!code) return;
+        if (!confirm('删除「' + (name || code) + '」在本地库里的日线数据？\n自选股列表不受影响。')) return;
+        await purgeStockQuiet(code);
+      };
+      // 从自选股移除：只改状态，落库由下面那个去抖的 /watchlist 覆盖保存完成 ——
+      // worker 的 watchlist_set 会按「不在列表里的 code」级联删掉日线与指标，
+      // 所以这里不能再单独调 purge（那会把刚删掉的股票又写回自选行）。
+      const del = id => {
+        const it = sk.watch.find(x => x.id === id);
+        if (!it) return;
+        if (!confirm('从自选股移除「' + (it.name || it.code) + '」？\n本地库里它的日线、指标会一并删除。')) return;
+        patch('stock', st => ({ ...st, watch: st.watch.filter(x => x.id !== id) }));
+        setTimeout(loadDb, 1200);
+      };
       // 拖动排序：after=true 落在目标行下方，否则落在上方
       const moveWatch = (fromId, toId, after) => {
         if (!fromId || !toId || fromId === toId) return;
@@ -6845,11 +7150,10 @@ window.__ModuleLoader__.load({
       };
       const changeSource = v => { setSource(v); try { localStorage.setItem('dsh-wb-stock-source', v); } catch (e) {} };
       const openDir = async () => {
-        try { await stockPost('/open-dir', {}); toast('已打开股票数据目录'); }
-        catch (e) {
-          try { await fetch(PREFIX + '/store/open', { method: 'POST' }); toast('已打开工作台数据目录（股票库在其下的「股票数据」）'); }
-          catch (e2) { toast('打开失败：' + e.message, 'danger'); }
-        }
+        try {
+          const r = await stockPost('/open-dir', {});
+          toast('已打开数据目录' + (r && r.dir ? '：' + r.dir : ''));
+        } catch (e) { toast('打开失败：' + ((e && e.message) || e), 'danger'); }
       };
 
       const q = code => sk.quotes[code] || null;
@@ -6890,7 +7194,9 @@ window.__ModuleLoader__.load({
               h('td', null, x.firstDate || '—'),
               h('td', null, x.lastDate || '—'),
               h('td', null, x.lastIndicator || '—'),
-              h('td', null, h(Btn, { className: 'sm', onClick: () => { setSelected(x.code); loadAnalysis(x.code, CHART_DAYS); } }, '看指标'))))))) :
+              h('td', null,
+                h(Btn, { className: 'sm', onClick: () => { setSelected(x.code); loadAnalysis(x.code, CHART_DAYS); } }, '看指标'),
+                h(Btn, { className: 'sm', onClick: () => purgeStock(x.code, x.name) }, '删除'))))))) :
           h('p', { className: 'wb-hint' }, '库里还没有日线。选数据源后点「下载近 6 年日线」。'),
         (db.lastSync && db.lastSync.length) ? h('p', { className: 'wb-hint', style: { marginTop: 8 } },
           '最近同步：' + (() => {
@@ -7112,7 +7418,8 @@ window.__ModuleLoader__.load({
           dbBody,
           h('p', { className: 'wb-hint', style: { margin: '8px 0 0' } },
             '日线默认存 ' + ((status && status.dbPath) || 'D:\\天源评估\\个人工作台\\股票数据\\stock.db')
-            + '。下载会覆盖同日期区间，指标按全部历史重算；数据源可在上面切换，AKShare 东财接口被限流时自动退回腾讯接口。')),
+            + '。下载会覆盖同日期区间，指标按全部历史重算；数据源可在上面切换，AKShare 东财接口被限流时自动退回腾讯接口。'
+            + '表格每行可单独删除该股的日线；从自选股移除时，库里的日线也会自动清理。')),
 
         h(Section, { title: '提醒设置' }, h('div', { className: 'wb-row', style: { marginBottom: 6 } },
           h('label', { className: 'wb-hint', style: { display: 'flex', gap: 6, alignItems: 'center' } },
@@ -7679,6 +7986,19 @@ window.__ModuleLoader__.load({
     }
 
     const DT_REV = 'rev22';
+    // 数据工具的统一取数：宿主未注册该路由时会返回纯文本 "not found"，
+    // 直接 r.json() 会抛 Unexpected token 'o'。这里把非 JSON 响应转成可读错误，
+    // 页面显示「宿主路由未就绪」而不是一句 JSON 解析异常。
+    async function dtJson(url, init) {
+      const r = await fetch(url, init);
+      const text = await r.text();
+      let data = null;
+      try { data = text ? JSON.parse(text) : {}; } catch (_) { data = null; }
+      if (data === null) {
+        throw new Error('宿主未返回 JSON（HTTP ' + r.status + '）：' + String(text || '').trim().slice(0, 160));
+      }
+      return { r, d: data };
+    }
     // DSH 桌面壳原生目录选择（preload: __DSH_DIRECTORY_PICKER__），uiWorkspace 不可用时兜底
     function dtPickDirectory() {
       try {
@@ -7708,7 +8028,7 @@ window.__ModuleLoader__.load({
       useEffect(() => {
         // 行政区目录：宿主 china-regions.cjs 一次性注入（缓存）
         if (window.__DT_REGION_CATALOG__) return;
-        fetch(DT_PREFIX + '/regions').then(r => r.json()).then(d => {
+        dtJson(DT_PREFIX + '/regions').then(({ d }) => {
           if (Array.isArray(d.catalog)) { window.__DT_REGION_CATALOG__ = d.catalog; setCatalog(d.catalog); }
         }).catch(() => {});
       }, []);
@@ -7825,9 +8145,8 @@ window.__ModuleLoader__.load({
       const loadRegions = useCallback(async () => {
         setRegionErr('');
         try {
-          const r = await fetch(DT_PREFIX + '/land/regions', { cache: 'no-store' });
-          const d = await r.json();
-          if (!d.ok) throw new Error(d.reason || ('HTTP ' + r.status));
+          const { r, d } = await dtJson(DT_PREFIX + '/land/regions', { cache: 'no-store' });
+          if (!d.ok) throw new Error(d.error || d.reason || ('HTTP ' + r.status));
           setRegions(d.regions || []);
         } catch (e) { setRegionErr('行政区加载失败：' + ((e && e.message) || e) + '（可点"刷新行政区"重试）'); }
       }, []);
@@ -7838,8 +8157,7 @@ window.__ModuleLoader__.load({
         if (!busy) return undefined;
         pollRef.current = setInterval(async () => {
           try {
-            const r = await fetch(DT_PREFIX + '/land/status', { cache: 'no-store' });
-            const d = await r.json();
+            const { d } = await dtJson(DT_PREFIX + '/land/status', { cache: 'no-store' });
             const t = d.task;
             if (t) {
               setTask(t);
@@ -7872,7 +8190,7 @@ window.__ModuleLoader__.load({
 
       const run = async () => {
         if (busy) return;
-        if (!outputDir.trim()) { toast('请先填写输出目录（留空则用工作台默认目录）', 'warn'); return; }
+        // 输出目录留空交给宿主落到默认目录（~/Documents/天源评估/个人工作台/数据工具输出/浙江土地成交公示）
         setBusy(true);
         setPaused(false);
         try {
@@ -8045,8 +8363,7 @@ window.__ModuleLoader__.load({
         if (!busy) return undefined;
         const t = setInterval(async () => {
           try {
-            const r = await fetch(DT_PREFIX + '/anjuke/status', { cache: 'no-store' });
-            const d = await r.json();
+            const { d } = await dtJson(DT_PREFIX + '/anjuke/status', { cache: 'no-store' });
             if (d.task) {
               setTask(d.task);
               if (d.task.status !== 'running') {
@@ -8305,8 +8622,7 @@ window.__ModuleLoader__.load({
         if (!busy) return undefined;
         const t = setInterval(async () => {
           try {
-            const r = await fetch(DT_PREFIX + '/auction/status', { cache: 'no-store' });
-            const d = await r.json();
+            const { d } = await dtJson(DT_PREFIX + '/auction/status', { cache: 'no-store' });
             if (d.task) {
               setTask(d.task);
               if (d.task.status !== 'running') {
@@ -8514,8 +8830,7 @@ window.__ModuleLoader__.load({
         if (!busy) return undefined;
         const t = setInterval(async () => {
           try {
-            const r = await fetch(DT_PREFIX + '/lease/status', { cache: 'no-store' });
-            const d = await r.json();
+            const { d } = await dtJson(DT_PREFIX + '/lease/status', { cache: 'no-store' });
             if (d.task) {
               setTask(d.task);
               if (d.task.status !== 'running') {
@@ -8699,8 +9014,7 @@ window.__ModuleLoader__.load({
         if (!busy) return undefined;
         const t = setInterval(async () => {
           try {
-            const r = await fetch(DT_PREFIX + '/' + toolId + '/status', { cache: 'no-store' });
-            const d = await r.json();
+            const { d } = await dtJson(DT_PREFIX + '/' + toolId + '/status', { cache: 'no-store' });
             if (d.task) {
               setTask(d.task);
               if (d.task.status !== 'running') {
@@ -8779,8 +9093,7 @@ window.__ModuleLoader__.load({
         if (!busy) return undefined;
         const t = setInterval(async () => {
           try {
-            const r = await fetch(DT_PREFIX + '/dep/status', { cache: 'no-store' });
-            const d = await r.json();
+            const { d } = await dtJson(DT_PREFIX + '/dep/status', { cache: 'no-store' });
             if (d.task) {
               setTask(d.task);
               if (d.task.status !== 'running') {
@@ -8859,56 +9172,127 @@ window.__ModuleLoader__.load({
           h('pre', { style: { overflow: 'auto', maxHeight: 220, padding: 8, background: 'var(--wb-surface-2)', borderRadius: 6, fontSize: 11, whiteSpace: 'pre-wrap' } }, readResult)) : null);
     }
 
-    // ---- 子面板三：地图基础配置 ----
+    // ---- 子面板三：地图基础配置（高德 + 百度） ----
+    // 两块共用一份 ~/.tianyuan-workbench/map-config.json，但各自保存各自的段：
+    // 宿主 POST /dt/map-config 按 amap / baidu 分段合并，保存一块不会清掉另一块。
     function DataToolsMap({ toast }) {
       const [summary, setSummary] = useState(null);
-      const [enabled, setEnabled] = useState(false);
+      const [amapEnabled, setAmapEnabled] = useState(false);
       const [webKey, setWebKey] = useState('');
       const [securityCode, setSecurityCode] = useState('');
+      const [baiduEnabled, setBaiduEnabled] = useState(false);
+      const [baiduAk, setBaiduAk] = useState('');
+      const [baiduSk, setBaiduSk] = useState('');
       const [busy, setBusy] = useState(false);
       const load = useCallback(async () => {
         try {
-          const r = await fetch(DT_PREFIX + '/map-config', { cache: 'no-store' });
-          const d = await r.json();
+          const { d } = await dtJson(DT_PREFIX + '/map-config', { cache: 'no-store' });
           setSummary(d);
-          setEnabled(d.enabled === true);
+          setAmapEnabled(d.amap ? d.amap.enabled === true : d.enabled === true);
+          setBaiduEnabled(!!(d.baidu && d.baidu.enabled === true));
         } catch (e) { toast('读取地图配置失败：' + ((e && e.message) || e), 'danger'); }
       }, [toast]);
       useEffect(() => { load(); }, [load]);
 
-      const save = async (clear) => {
+      const post = async (body) => {
+        const r = await fetch(DT_PREFIX + '/map-config', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
+        });
+        const text = await r.text();
+        let d = null;
+        try { d = text ? JSON.parse(text) : {}; } catch (_) { d = null; }
+        if (d === null) throw new Error('宿主未返回 JSON（HTTP ' + r.status + '）：' + String(text || '').trim().slice(0, 160));
+        if (!r.ok || d.ok === false) throw new Error(d.error || ('HTTP ' + r.status));
+        return d;
+      };
+
+      const saveAmap = async (clear) => {
         setBusy(true);
         try {
-          const body = clear ? { clear: true }
-            : { amap: { enabled, webKey: webKey.trim(), securityJsCode: securityCode.trim(), preserveExisting: !!(summary && summary.configured) } };
-          const r = await fetch(DT_PREFIX + '/map-config', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
-          const d = await r.json().catch(() => ({}));
-          if (!r.ok || d.ok === false) throw new Error(d.error || ('HTTP ' + r.status));
+          const amap = clear
+            ? { clear: true }
+            : { enabled: amapEnabled, webKey: webKey.trim(), securityJsCode: securityCode.trim(), preserveExisting: !!(summary && summary.webKeyConfigured) };
+          const d = await post(clear ? { clear: true } : { amap });
           setSummary(d); setWebKey(''); setSecurityCode('');
-          toast(clear ? '已恢复默认公共底图' : (d.enabled ? '已保存地图配置' : '已保存（官方高德底图未启用）'));
+          toast(clear ? '已恢复默认公共底图' : ((d.amap ? d.amap.enabled : d.enabled) ? '已保存高德配置' : '已保存（官方高德底图未启用）'));
         } catch (e) { toast('保存失败：' + ((e && e.message) || e), 'danger'); }
         finally { setBusy(false); }
       };
 
-      const configured = !!(summary && summary.configured);
-      return h('div', { style: { display: 'grid', gap: 14, marginTop: 8 } },
-        h('div', { className: 'wb-alert', style: { fontSize: 12 } }, '默认使用公共底图并自动切换；只有默认底图全部无法加载时，才需要启用官方高德 API。配置只保存在本机（~/.tianyuan-workbench/map-config.json），不会上传。'),
-        h('div', { style: { display: 'flex', gap: 10, alignItems: 'center' } },
-          h('h3', { style: { margin: 0, fontSize: 13 } }, '官方高德地图'),
-          h('span', { style: { fontSize: 11, padding: '1px 8px', borderRadius: 8, color: '#fff', background: configured ? 'var(--wb-ok-ink,#1b8a5a)' : 'var(--wb-chip-grey,#eef0f1)' } }, configured ? '已配置' : '未配置')),
-        h('p', { className: 'wb-hint' }, '还没有 Key？在高德开放平台创建"Web 端（JS API）"应用和 Key：',
-          ' ', h('a', { className: 'wb-link', href: 'https://console.amap.com/dev/key/app', target: '_blank', rel: 'noopener noreferrer' }, '打开高德 API 配置页面')),
-        h('label', { style: { display: 'flex', gap: 6, alignItems: 'center', fontSize: 12, cursor: 'pointer' } },
-          h('input', { type: 'checkbox', checked: enabled, onChange: e => setEnabled(e.target.checked) }), '启用官方高德底图备用源'),
-        h('div', { style: { display: 'grid', gap: 10, maxWidth: 560 } },
-          h('label', { className: 'wb-label' }, '高德 Web 端（JS API）Key',
-            h('input', { className: 'wb-input', style: { width: '100%' }, type: 'password', autoComplete: 'off', value: webKey, placeholder: configured ? '留空表示保留原 Key' : '启用时填写', onChange: e => setWebKey(e.target.value) })),
-          h('label', { className: 'wb-label' }, '安全密钥（可选）',
-            h('input', { className: 'wb-input', style: { width: '100%' }, type: 'password', autoComplete: 'off', value: securityCode, placeholder: '如高德控制台要求则填写', onChange: e => setSecurityCode(e.target.value) }))),
-        summary && summary.configured ? h('p', { className: 'wb-hint', style: { color: 'var(--wb-ok-ink,#1b8a5a)' } }, '本机已配置高德 API（Key：' + (summary.webKeyMasked || '已隐藏') + '）。留空 Key 保存时会保留现有配置。') : h('p', { className: 'wb-hint' }, '当前使用默认公共底图；默认底图全部失败时，地图会提示在此处配置官方 API。'),
-        h('div', { style: { display: 'flex', gap: 8 } },
-          h('button', { className: 'wb-btn', onClick: () => save(false), disabled: busy }, '保存地图配置'),
-          h('button', { className: 'wb-btn sm', onClick: () => save(true), disabled: busy }, '恢复默认底图')));
+      const saveBaidu = async () => {
+        setBusy(true);
+        try {
+          const d = await post({
+            baidu: {
+              enabled: baiduEnabled,
+              webApiAk: baiduAk.trim(),
+              agentPlanSk: baiduSk.trim(),
+              preserveExisting: !!(summary && summary.baidu && summary.baidu.configured),
+            },
+          });
+          setSummary(d); setBaiduAk(''); setBaiduSk('');
+          toast((d.baidu && d.baidu.enabled) ? '已保存百度地图配置' : '已保存（百度地图未启用）');
+        } catch (e) { toast('保存失败：' + ((e && e.message) || e), 'danger'); }
+        finally { setBusy(false); }
+      };
+
+      const amapConfigured = !!(summary && (summary.webKeyConfigured || (summary.amap && summary.amap.webKeyConfigured)));
+      const amapMasked = (summary && (summary.webKeyMasked || (summary.amap && summary.amap.webKeyMasked))) || '';
+      const binfo = (summary && summary.baidu) || {};
+      const baiduConfigured = !!(binfo.webApiAkConfigured || binfo.agentPlanSkConfigured);
+      const badge = (on) => h('span', { style: { fontSize: 11, padding: '1px 8px', borderRadius: 8, color: '#fff', background: on ? 'var(--wb-ok-ink,#1b8a5a)' : 'var(--wb-chip-grey,#eef0f1)' } }, on ? '已配置' : '未配置');
+
+      return h('div', { style: { display: 'grid', gap: 18, marginTop: 8 } },
+        h('div', { className: 'wb-alert', style: { fontSize: 12 } }, '默认使用公共底图并自动切换；只有默认底图全部无法加载时，才需要启用官方地图 API。配置只保存在本机（~/.tianyuan-workbench/map-config.json），不会上传。'),
+
+        // —— 高德 ——
+        h('div', { style: { display: 'grid', gap: 12 } },
+          h('div', { style: { display: 'flex', gap: 10, alignItems: 'center' } },
+            h('h3', { style: { margin: 0, fontSize: 13 } }, '官方高德地图'), badge(amapConfigured)),
+          h('p', { className: 'wb-hint' }, '还没有 Key？在高德开放平台创建"Web 端（JS API）"应用和 Key：',
+            ' ', h('a', { className: 'wb-link', href: 'https://console.amap.com/dev/key/app', target: '_blank', rel: 'noopener noreferrer' }, '打开高德 API 配置页面')),
+          h('label', { style: { display: 'flex', gap: 6, alignItems: 'center', fontSize: 12, cursor: 'pointer' } },
+            h('input', { type: 'checkbox', checked: amapEnabled, onChange: e => setAmapEnabled(e.target.checked) }), '启用官方高德底图备用源'),
+          h('div', { style: { display: 'grid', gap: 10, maxWidth: 560 } },
+            h('label', { className: 'wb-label' }, '高德 Web 端（JS API）Key',
+              h('input', { className: 'wb-input', style: { width: '100%' }, type: 'password', autoComplete: 'off', value: webKey, placeholder: amapConfigured ? '留空表示保留原 Key' : '启用时填写', onChange: e => setWebKey(e.target.value) })),
+            h('label', { className: 'wb-label' }, '安全密钥（可选）',
+              h('input', { className: 'wb-input', style: { width: '100%' }, type: 'password', autoComplete: 'off', value: securityCode, placeholder: '如高德控制台要求则填写', onChange: e => setSecurityCode(e.target.value) }))),
+          amapConfigured ? h('p', { className: 'wb-hint', style: { color: 'var(--wb-ok-ink,#1b8a5a)' } }, '本机已配置高德 API（Key：' + (amapMasked || '已隐藏') + '）。留空 Key 保存时会保留现有配置。') : h('p', { className: 'wb-hint' }, '当前未配置高德 API。'),
+          h('div', { style: { display: 'flex', gap: 8 } },
+            h('button', { className: 'wb-btn', onClick: () => saveAmap(false), disabled: busy }, '保存高德配置'),
+            h('button', { className: 'wb-btn sm', onClick: () => saveAmap(true), disabled: busy }, '恢复默认底图'))),
+
+        h('hr', { style: { border: 0, borderTop: '1px solid var(--wb-border,#e6e8ea)', margin: 0 } }),
+
+        // —— 百度 ——
+        h('div', { style: { display: 'grid', gap: 12 } },
+          h('div', { style: { display: 'flex', gap: 10, alignItems: 'center' } },
+            h('h3', { style: { margin: 0, fontSize: 13 } }, '百度地图'), badge(baiduConfigured)),
+          h('p', { className: 'wb-hint' }, '百度有两套凭证，按用途填其中一个或都填：',
+            h('br'), '· Web 服务 AK（地址解析 / POI 检索 / 路线规划 / 行政区划 / 天气），走 https://api.map.baidu.com/ ，也可用环境变量 BMAP_WEBAPI_AK；',
+            h('br'), '· Agent Plan SK（AI 语义检索 / 语义路线），走 /agent_plan/v1/* ，也可用环境变量 BAIDU_MAP_AUTH_TOKEN；',
+            h('br'), ' ', h('a', { className: 'wb-link', href: 'https://lbs.baidu.com/apiconsole/key', target: '_blank', rel: 'noopener noreferrer' }, '申请服务端 AK'), ' · ',
+            h('a', { className: 'wb-link', href: 'https://lbs.baidu.com/apiconsole/agentplan', target: '_blank', rel: 'noopener noreferrer' }, '申请 Agent Plan SK')),
+          h('label', { style: { display: 'flex', gap: 6, alignItems: 'center', fontSize: 12, cursor: 'pointer' } },
+            h('input', { type: 'checkbox', checked: baiduEnabled, onChange: e => setBaiduEnabled(e.target.checked) }), '启用百度地图（供数据工具与助手调用）'),
+          h('div', { style: { display: 'grid', gap: 10, maxWidth: 560 } },
+            h('label', { className: 'wb-label' }, '百度 Web 服务 AK（服务端）',
+              h('input', { className: 'wb-input', style: { width: '100%' }, type: 'password', autoComplete: 'off', value: baiduAk, placeholder: binfo.webApiAkConfigured ? (binfo.webApiAkFromEnv ? '已由环境变量 BMAP_WEBAPI_AK 提供，留空沿用' : '留空表示保留原 AK') : '如 BMapWebServiceAk', onChange: e => setBaiduAk(e.target.value) })),
+            h('label', { className: 'wb-label' }, '百度 Agent Plan SK',
+              h('input', { className: 'wb-input', style: { width: '100%' }, type: 'password', autoComplete: 'off', value: baiduSk, placeholder: binfo.agentPlanSkConfigured ? (binfo.agentPlanSkFromEnv ? '已由环境变量 BAIDU_MAP_AUTH_TOKEN 提供，留空沿用' : '留空表示保留原 SK') : '如 AgentPlanSk', onChange: e => setBaiduSk(e.target.value) }))),
+          baiduConfigured
+            ? h('p', { className: 'wb-hint', style: { color: 'var(--wb-ok-ink,#1b8a5a)' } },
+              '本机已配置百度地图：',
+              binfo.webApiAkConfigured ? ('Web 服务 AK ' + (binfo.webApiAkMasked || '已隐藏')) : '未填 Web 服务 AK',
+              '；',
+              binfo.agentPlanSkConfigured ? ('Agent Plan SK ' + (binfo.agentPlanSkMasked || '已隐藏')) : '未填 Agent Plan SK',
+              '。留空保存会保留现有凭证。')
+            : h('p', { className: 'wb-hint' }, '当前未配置百度地图。'),
+          h('div', { style: { display: 'flex', gap: 8 } },
+            h('button', { className: 'wb-btn', onClick: () => saveBaidu(), disabled: busy }, '保存百度配置'))),
+
+        h('p', { className: 'wb-hint', style: { fontSize: 11 } }, '配置文件：' + ((summary && summary.path) || '~/.tianyuan-workbench/map-config.json')));
     }
 
     // ---------- 报告比对：Word 线下改稿 ↔ 天源线上报告节点 ----------
@@ -9831,8 +10215,9 @@ window.__ModuleLoader__.load({
         : (mcp.expired ? '授权已过期，请在「工作 → 连接设置」重新连接' : '未绑定，请在「工作 → 连接设置」完成授权');
       const cliLine = !cli ? '正在检查…'
         : cli.error ? '检查失败：' + cli.error
-        : !cli.installed ? '未安装 tycpv CLI'
+        : !cli.installed ? '未找到 tycpv CLI' + (cli.reason ? '：' + cli.reason : '')
         : cli.authenticated ? '本地凭据有效' + (cli.expiresAt ? '，至 ' + fmtExp(cli.expiresAt) : '') + '（不等于远端授权一定有效）'
+        : cli.expired ? '本地凭据已过期' + (cli.expiresAt ? '（' + fmtExp(cli.expiresAt) + '）' : '') + '，请在「工作 → 连接设置」点「授权 CLI」'
         : '无有效本地凭据，请在「工作 → 连接设置」点「授权 CLI」';
       return h('div', { style: { padding: '10px 12px', fontSize: 12, color: 'var(--dsw-alias-label-primary,#222)', overflow: 'auto', height: '100%', boxSizing: 'border-box' } },
         liteToast && h('div', { style: { position: 'fixed', top: 14, right: 14, zIndex: 99, padding: '6px 12px', borderRadius: 8, background: liteToast.kind === 'danger' ? 'var(--dsw-alias-state-error-primary,#c0392b)' : 'var(--dsw-alias-state-success-primary,#2e7d32)', color: '#fff', fontSize: 12, boxShadow: '0 2px 8px rgba(0,0,0,.25)' } }, liteToast.msg),
@@ -10275,8 +10660,9 @@ window.__ModuleLoader__.load({
         : (mcp.expired ? '授权已过期，请在「工作 → 连接设置」重新连接' : '未绑定，请在「工作 → 连接设置」完成授权');
       const cliLine = !cli ? '正在检查…'
         : cli.error ? '检查失败：' + cli.error
-        : !cli.installed ? '未安装 tycpv CLI'
+        : !cli.installed ? '未找到 tycpv CLI' + (cli.reason ? '：' + cli.reason : '')
         : cli.authenticated ? '本地凭据有效' + (cli.expiresAt ? '，至 ' + fmtExp(cli.expiresAt) : '') + '（不等于远端授权一定有效）'
+        : cli.expired ? '本地凭据已过期' + (cli.expiresAt ? '（' + fmtExp(cli.expiresAt) + '）' : '') + '，请在「工作 → 连接设置」点「授权 CLI」'
         : '无有效本地凭据，请在「工作 → 连接设置」点「授权 CLI」';
       const dot = ok => h('span', { style: { display: 'inline-block', width: 8, height: 8, borderRadius: 4, background: ok ? 'var(--dsw-alias-state-success-primary,#2e7d32)' : 'var(--dsw-alias-border-l2,#aaa)', marginRight: 6 } });
       const tools = [
