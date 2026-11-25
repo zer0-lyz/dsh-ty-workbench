@@ -3396,6 +3396,32 @@ window.__ModuleLoader__.load({
           if (got) setTab(only);
           if (got) toast('已读入' + (only === 'income_statement' ? '利润表' : '资产负债表') + '「' + (got.sheet || '') + '」' + (got.rows || []).length + ' 行（' + f.name + '）', 'info');
           else toast('这个文件里没有' + (only === 'income_statement' ? '利润表（利）' : '资产负债表（资）') + '页', 'warn');
+          // 两步走·第二步：报表读进来后，用资产负债表里非零的源科目金额补齐本地科目表，
+          // 并按「方法 + 科目」补齐对应的科目文件夹（幂等）。科目没变时目录也已存在，等于无操作。
+          if (got && got.statementType === 'balance_sheet' && got.sheetData && Array.isArray(got.sheetData.detail)) {
+            const picked = (got.sheetData.detail)
+              .map(x => ({ name: String(x.originName || '').trim(), amount: numOf(x.amount) }))
+              .filter(x => x.name && x.amount != null && Math.abs(x.amount) > 0);
+            if (picked.length) {
+              const base = finSubjects(s, project.id, cid);
+              const merged = base.slice();
+              let addN = 0; let overN = 0;
+              picked.forEach(p => {
+                const idx = merged.map(x => x.name).indexOf(p.name);
+                if (idx >= 0) { merged[idx] = { name: p.name, amount: String(p.amount) }; overN += 1; }
+                else { merged.push({ name: p.name, amount: String(p.amount) }); addN += 1; }
+              });
+              finUpdate(project.id, cid, () => merged);
+              const after = rows.map(r2 => ({
+                name: r2.name,
+                methods: r2.methods || { whole: [], part: [] },
+                subjects: r2.id === cid ? merged : finSubjects(s, project.id, r2.id).map(x => ({ name: x.name, amount: x.amount })),
+              })).filter(r2 => r2.name && r2.name !== '被评估单位');
+              buildProjectFoldersFrom(project, after, toast, true)
+                .then(() => toast('已按报表科目补齐本地科目表（新增 ' + addN + '、覆盖 ' + overN + '），科目文件夹已对齐', 'info'))
+                .catch(() => {});
+            }
+          }
         } catch (err) {
           toast('读取失败：' + String((err && err.message) || err), 'warn');
         } finally { setBusy(''); }
