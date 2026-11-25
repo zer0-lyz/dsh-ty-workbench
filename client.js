@@ -2591,6 +2591,9 @@ window.__ModuleLoader__.load({
       : '02现场资料/企业提供资料/02基础类/' + (segSafe(company) || '未命名公司') + '/' + cat);
     // 财务类资料：每家公司一套（00财务资料/<公司>）
     const financeFolderOf = company => '02现场资料/企业提供资料/00财务资料/' + (segSafe(company) || '未命名公司');
+    // 报表原件夹：客户给的各期报表放这里，「从「01财务报表」导入」就扫这个夹
+    // （夹名与 folders.js 的 FIN_STATEMENT_DIR 必须一致）
+    const financeStatementsFolderOf = company => financeFolderOf(company) + '/01财务报表';
     // 基础类资料：每家公司一套（02基础类/<公司>，里面再分 4 个分类）
     const basicFolderOf = company => '02现场资料/企业提供资料/02基础类/' + (segSafe(company) || '未命名公司');
 
@@ -3323,6 +3326,11 @@ window.__ModuleLoader__.load({
       const fileIncRef = useRef(null);
       const fileRef = useRef(null);                 // 「导入科目余额表」总入口（旧按钮保留，与下面分表导入并存）
       const [importKind, setImportKind] = useState('balance_sheet');
+      // 「从 01财务报表 文件夹导入」：扫一次目录拿到所有期，批量预检 + 一次确认写天源
+      const [scan, setScan] = useState(null);       // /project/finance/scan 的结果
+      const [scanKeep, setScanKeep] = useState({}); // 每期是否参与导入（默认全选）
+      const [scanForce, setScanForce] = useState({}); // 人工指定的页分类 {文件名::页名: 'balance'|'income'|'skip'}
+      const [batch, setBatch] = useState(null);     // 批量预检结果（待一次确认）
       const cur = lockId
         ? (rows.filter(r => r.id === lockId)[0] || null)
         : (rows.filter(r => r.id === who)[0] || rows[0] || null);
@@ -3433,6 +3441,115 @@ window.__ModuleLoader__.load({
         if (!r.ok) throw new Error('HTTP ' + r.status);
         if (d && d.isError) throw new Error(typeof d.data === 'string' ? d.data.slice(0, 300) : '天源返回错误');
         return d && d.data !== undefined ? d.data : d && d.structuredContent;
+      };
+
+      // ── 从「01财务报表」文件夹批量导入 ───────────────────────────────
+      // 客户把各期报表原件丢进 00财务资料/<公司>/01财务报表，这里扫一遍目录，
+      // 自动认出每页是资还是利、属于哪一年；认不出的页让用户指定分类；然后一次预检、一次确认写天源。
+      const scanFolder = async (force) => {
+        if (!cur) return;
+        setBusy('scan');
+        setBatch(null);
+        try {
+          const r = await fetch(PREFIX + '/project/finance/scan', {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              folder: folderNameOf(project), abs: projectAbs(project),
+              company: cur.name, basedate: baseDate || '',
+              force: force || scanForce,
+            }),
+          });
+          if (r.status === 404) throw new Error('宿主未重载，重启 DSH 后可用');
+          const d = await r.json().catch(() => ({}));
+          if (!r.ok || !d.ok) throw new Error((d && d.error) || ('HTTP ' + r.status));
+          setScan(d);
+          const keep = {};
+          (d.packs || []).forEach(p => { keep[p.statementType + '@' + p.year] = true; });
+          setScanKeep(keep);
+          const n = (d.packs || []).length;
+          const nm = (d.needManual || []).length;
+          if (!(d.files || []).length) toast('「01财务报表」文件夹是空的：把各期报表放进去再点一次（已帮你把目录建好）', 'warn');
+          else if (!n) toast('扫到 ' + d.files.length + ' 个文件，但没有认出可导入的报表' + (nm ? '，有 ' + nm + ' 页需要你指定分类' : ''), 'warn');
+          else toast('扫到 ' + d.files.length + ' 个文件，认出 ' + n + ' 张报表（' + (d.summary.balanceYears.join('/') || '无') + ' 资 · ' + (d.summary.incomeYears.join('/') || '无') + ' 利）' + (nm ? '，' + nm + ' 页待指定' : ''), 'info');
+        } catch (e) {
+          toast('扫描失败：' + String((e && e.message) || e), 'warn');
+        } finally { setBusy(''); }
+      };
+      // 人工指定某页的分类 → 记下选择后重扫（force 覆盖自动判定）
+      const setSheetKind = (fileName, sheet, kind) => {
+        const next = Object.assign({}, scanForce, { [fileName + '::' + sheet]: kind });
+        setScanForce(next);
+        scanFolder(next);
+      };
+      // 批量预检：按报表类型分组，每种类型一次 prepare（sheetList 里放该类型的所有年度）
+      const prepareBatch = async () => {
+        const p = box.tyProjectId; const c = box.tyCompanyId;
+        if (!p || !c) { toast('先在右边选这家公司对应的天源项目和公司', 'warn'); return; }
+        const packs = ((scan && scan.packs) || []).filter(x => scanKeep[x.statementType + '@' + x.year]);
+        if (!packs.length) { toast('没有勾选任何要导入的报表', 'warn'); return; }
+        setBusy('batch');
+        setBatch(null);
+        const runs = []; const errs = [];
+        for (const st of ['balance_sheet', 'income_statement']) {
+          const group = packs.filter(x => x.statementType === st);
+          if (!group.length) continue;
+          const sheets = group.map(x => Object.assign({}, x.sheetData, { reportYear: Number(x.year) || null }));
+          try {
+            const d = await call('prepare_financial_statement_report_import', {
+              projectId: Number(p), companyId: Number(c),
+              statementType: st, reportMode: Number(mode),
+              missingSubjectPolicy: 'preserve_existing', includeRequestBody: false,
+              sheetList: sheets,
+            });
+            if (!d || !d.success) {
+              const ves = (d && d.validationErrors) || [];
+              errs.push({
+                statementType: st,
+                error: (d && (d.error || d.message)) || '预检未通过',
+                details: ves.slice(0, 8).map(x => (x.reportYear ? x.reportYear + ' ' : '') + (x.originName || x.subjectName || '') + '（' + (x.error || '对不上模板') + '）'),
+              });
+              continue;
+            }
+            runs.push({ statementType: st, years: group.map(x => x.year), token: d.confirmationToken, prompt: d.confirmationPrompt, dataPrompt: d.confirmationDataPrompt, preview: d.preview });
+          } catch (e) {
+            errs.push({ statementType: st, error: String((e && e.message) || e), details: [] });
+          }
+        }
+        setBatch({ runs: runs, errors: errs });
+        if (!runs.length) toast('预检没通过，看下面的原因', 'warn');
+        else toast('预检通过 ' + runs.length + ' 张表' + (errs.length ? '，' + errs.length + ' 张没过' : '') + '，核对后点确认', 'info');
+        setBusy('');
+      };
+      // 一次确认：把预检通过的表逐张写进天源
+      const executeBatch = async () => {
+        if (!batch || !batch.runs.length) return;
+        setBusy('batchExec');
+        const done = []; const failed = [];
+        for (const run of batch.runs) {
+          try {
+            const d = await call('execute_financial_statement_report_import', { confirmationToken: run.token, confirmed: true });
+            if (!d || !(d.success || d.ok)) throw new Error((d && (d.error || d.message)) || '保存失败');
+            done.push(run);
+          } catch (e) {
+            failed.push({ statementType: run.statementType, years: run.years, error: String((e && e.message) || e) });
+          }
+        }
+        if (done.length) {
+          const last = done[done.length - 1];
+          fsUpdate(project.id, cid, mode, b => Object.assign({}, b, {
+            lastResult: {
+              at: new Date().toISOString(), statementType: last.statementType, mode: Number(mode),
+              prompt: done.map(r => (r.statementType === 'income_statement' ? '利润表 ' : '资产负债表 ') + r.years.join('/')).join('、'),
+              summary: ((last.preview || {}).sheets || [])[0] || null, message: '已保存到天源',
+            },
+          }));
+        }
+        setBatch({ runs: [], errors: failed.map(x => ({ statementType: x.statementType, error: x.error + '（' + x.years.join('/') + '）', details: [] })) });
+        if (done.length) toast('已写入天源 ' + done.length + ' 张表：' + done.map(r => (r.statementType === 'income_statement' ? '利润表' : '资产负债表') + r.years.join('/')).join('、'), 'info');
+        if (failed.length) toast(failed.length + ' 张表写入失败，看下面的原因', 'warn');
+        setBusy('');
+        // 写成功后把天源现有年度拉回来，页签上的「（年度）」跟着更新
+        if (done.length) { try { await refreshReports(); } catch (e) {} }
       };
 
       // 两步走：先 prepare（天源只校验不保存），用户看过金额再 execute
@@ -3701,6 +3818,106 @@ window.__ModuleLoader__.load({
       });
       const previewRows = (pending && pending.preview && (pending.preview.sheets || [])[0] && (pending.preview.sheets || [])[0].amountPreview) || [];
       const reportRows = ((result && result.reports) || []).reduce((acc, r) => acc.concat((r.worksheetRows || []).filter(w => { const vs = w.values || {}; return Object.keys(vs).some(k => vs[k] != null && vs[k] !== 0); }).map(w => Object.assign({}, w, { _years: Object.keys(w.values || {}).sort().reverse() }))), []).slice(0, 200);
+      // 扫描结果里「认不出的页」：让人工指定这页是资产负债表还是利润表
+      const kindOptions = m => ['', 'balance', 'income', 'skip'].map(v => h('option', { key: v || 'none', value: v },
+        v === '' ? '请选择' : (v === 'balance' ? '资产负债表' : (v === 'income' ? '利润表' : '跳过'))));
+      const manualRow = (m, i) => {
+        const key = m.fileName + '::' + m.sheet;
+        const sel = h('select', {
+          className: 'pf-sel',
+          value: scanForce[key] || '',
+          onChange: e => setSheetKind(m.fileName, m.sheet, e.target.value),
+        }, kindOptions(m));
+        return h('tr', { key: i },
+          h('td', null, m.fileName),
+          h('td', null, m.sheet),
+          h('td', { className: 'pf-hint' }, m.reason),
+          h('td', null, sel));
+      };
+      const needManualBox = (scan && (scan.needManual || []).length)
+        ? h('div', { className: 'pf-table-wrap', style: { maxHeight: 200, overflow: 'auto', marginTop: 6 } },
+          h('table', { className: 'pf-grid pw-grid' },
+            h('thead', null, h('tr', null, ['文件', '页签', '情况', '指定为'].map((t, i) => h('th', { key: i }, t)))),
+            h('tbody', null, scan.needManual.map(manualRow))))
+        : null;
+      // 认出来的报表：勾选要导入的期
+      const packRow = (p, i) => {
+        const k = p.statementType + '@' + p.year;
+        return h('tr', { key: i },
+          h('td', null, h('input', {
+            type: 'checkbox', checked: !!scanKeep[k],
+            onChange: e => setScanKeep(Object.assign({}, scanKeep, { [k]: e.target.checked })),
+          })),
+          h('td', null, p.statementType === 'income_statement' ? '利润表' : '资产负债表'),
+          h('td', null, String(p.year)),
+          h('td', null, p.period || ''),
+          h('td', null, p.fileName),
+          h('td', null, p.sheet),
+          h('td', { style: { textAlign: 'right' } }, String(((p.sheetData || {}).detail || []).length)));
+      };
+      const packBox = (scan && (scan.packs || []).length)
+        ? h('div', { className: 'pf-table-wrap', style: { maxHeight: 260, overflow: 'auto', marginTop: 6 } },
+          h('table', { className: 'pf-grid pw-grid' },
+            h('thead', null, h('tr', null, ['导入', '报表', '年度', '期间', '文件', '页签', '可写科目'].map((t, i) => h('th', { key: i }, t)))),
+            h('tbody', null, scan.packs.map(packRow))))
+        : null;
+      // 同一期给了两个文件：告诉用户留了哪个
+      const conflictBox = (scan && (scan.conflicts || []).length)
+        ? h('p', { className: 'pf-hint', style: { marginTop: 6 } }, '同期有多个文件，只导入后者：'
+          + scan.conflicts.map(c => (c.statementType === 'income_statement' ? '利润表' : '资产负债表') + c.year + ' 用 ' + c.kept + '（忽略 ' + c.dropped + '）').join('；'))
+        : null;
+      const scanBox = scan
+        ? h('div', { className: 'pf-card', style: { marginTop: 10 } },
+          h('p', null, h('b', null, '「01财务报表」里扫到 ' + (scan.files || []).length + ' 个文件、' + (scan.packs || []).length + ' 张报表')),
+          h('p', { className: 'pf-hint' }, '目录：' + (scan.rel || '') + '（点下面「打开报表文件夹」把各期报表放进去，再点「重新扫描」）'),
+          needManualBox,
+          packBox,
+          conflictBox,
+          h('div', { className: 'pw-acts', style: { marginTop: 6 } },
+            h('button', { type: 'button', className: 'pf-btn', disabled: busy === 'scan', onClick: () => scanFolder() }, busy === 'scan' ? '扫描中…' : '重新扫描'),
+            h('button', { type: 'button', className: 'pf-btn', onClick: () => openSub(financeStatementsFolderOf(cur.name)) }, '打开报表文件夹'),
+            h('button', {
+              type: 'button', className: 'pf-btn pri',
+              disabled: busy === 'batch' || !(scan.packs || []).some(p => scanKeep[p.statementType + '@' + p.year]),
+              onClick: prepareBatch,
+            }, busy === 'batch' ? '预检中…' : '预检选中各期（一次写天源）'),
+            h('button', { type: 'button', className: 'pf-btn', onClick: () => { setScan(null); setBatch(null); } }, '收起')))
+        : null;
+      // 批量预检结果：一次确认写全部
+      const batchRunBox = (r, i) => {
+        const rows = [];
+        (((r.preview || {}).sheets) || []).forEach((sh, si) => {
+          (sh.amountPreview || []).forEach((x, xi) => {
+            rows.push(h('tr', { key: si + '-' + xi },
+              h('td', null, String(sh.reportYear || '')),
+              h('td', null, x.subjectName),
+              h('td', { style: { textAlign: 'right' } }, fmt(x.amount))));
+          });
+        });
+        return h('div', { key: i, style: { marginTop: 6 } },
+          h('p', { className: 'pf-hint' }, h('b', null, (r.statementType === 'income_statement' ? '利润表' : '资产负债表') + ' ' + (r.years || []).join('/')), '　' + (r.prompt || '')),
+          h('div', { className: 'pf-table-wrap', style: { maxHeight: 180, overflow: 'auto' } },
+            h('table', { className: 'pf-grid pw-grid' },
+              h('thead', null, h('tr', null, ['年度', '科目', '金额'].map((t, j) => h('th', { key: j }, t)))),
+              h('tbody', null, rows))));
+      };
+      const batchErrBox = (batch && (batch.errors || []).length)
+        ? h('div', { style: { marginTop: 6 } }, batch.errors.map((e, i) => h('p', { key: i, className: 'pf-hint' },
+          h('b', null, '✗ ' + (e.statementType === 'income_statement' ? '利润表' : '资产负债表') + '：'), e.error,
+          (e.details || []).length ? h('span', null, '（' + e.details.join('；') + '）') : null)))
+        : null;
+      const batchBox = batch
+        ? h('div', { className: 'pf-card', style: { marginTop: 10 } },
+          h('p', null, h('b', null, (batch.errors || []).length ? '预检结果（有未通过的）' : '天源预检通过，请核对后一次保存全部：')),
+          (batch.runs || []).map(batchRunBox),
+          batchErrBox,
+          h('div', { className: 'pw-acts', style: { marginTop: 6 } },
+            h('button', {
+              type: 'button', className: 'pf-btn pri',
+              disabled: busy === 'batchExec' || !(batch.runs || []).length, onClick: executeBatch,
+            }, busy === 'batchExec' ? '保存中…' : '确认保存全部到天源'),
+            h('button', { type: 'button', className: 'pf-btn', onClick: () => setBatch(null) }, '取消')))
+        : null;
 
       return h('div', null,
         // ── 第一行：公司 + 天源对接 + 导入按钮
@@ -3726,7 +3943,13 @@ window.__ModuleLoader__.load({
             h('button', {
               type: 'button', className: 'pf-btn' + (tab === 'income_statement' ? ' pri' : ''), disabled: busy === 'read',
               onClick: () => { setImportKind('income_statement'); if (fileIncRef.current) fileIncRef.current.click(); },
-            }, busy === 'read' && importKind === 'income_statement' ? '读取中…' : '导入利润表')),
+            }, busy === 'read' && importKind === 'income_statement' ? '读取中…' : '导入利润表'),
+            h('button', {
+              type: 'button', className: 'pf-btn' + (scan && (scan.packs || []).length ? ' pri' : ''),
+              title: '扫 00财务资料/<公司>/01财务报表 里客户给的各期报表，自动认出资产/负债/利润各页，一次导入所有期',
+              disabled: busy === 'scan',
+              onClick: () => scanFolder(),
+            }, busy === 'scan' ? '扫描中…' : '从「01财务报表」导入')),
           h('input', { type: 'file', accept: '.xlsx,.xlsm,.csv', ref: fileRef, style: { display: 'none' }, onChange: onFile }),
           h('input', { type: 'file', accept: '.xlsx,.xlsm,.xls', ref: fileBalRef, style: { display: 'none' }, onChange: e => onFile(e, 'balance_sheet') }),
           h('input', { type: 'file', accept: '.xlsx,.xlsm,.xls', ref: fileIncRef, style: { display: 'none' }, onChange: e => onFile(e, 'income_statement') }),
@@ -3772,6 +3995,10 @@ window.__ModuleLoader__.load({
                     vals.map((v, j) => h('td', { key: j, style: { textAlign: 'right' } }, fmt(v))));
                 }))))
             : fsBlankTable(tab, fsIsTyOnly(sd) ? ((result.tyRows || []).map(w => w.subjectName)) : null, periods, tyMemo)),
+        // ── 从「01财务报表」文件夹批量导入：扫描结果 / 人工分类 / 一次确认
+        scanBox,
+        // ── 批量预检结果：一次确认写全部
+        batchBox,
         // ── 写天源 / 查看天源
         h('div', { className: 'pw-acts', style: { marginTop: 10 } },
           h('button', { type: 'button', className: 'pf-btn pri', disabled: !sd.sheetData || fsIsTyOnly(sd) || busy === 'prepare', onClick: prepare }, busy === 'prepare' ? '预检中…' : '预检并写天源（' + (mode === '2' ? '合并' : '单体') + '）'),
@@ -5060,6 +5287,7 @@ window.__ModuleLoader__.load({
     // 目录树的可视化管理：增删改任意层级目录，保存后 /project/folders/build 就按它建骨架。
     // 数据契约见 folder-template.js：{ version:1, groups:[{ name, children:[…] }] }，层级≤5、目录≤400。
     function FolderTemplatePage({ toast, onDirtyChange }) {
+      const REV = 'r20261125-2300';   // 版本标记：显示在页头，用于确认面板加载的是哪一代 client.js
       const [tpl, setTpl] = useState(null);          // 当前编辑中的树
       const [saved, setSaved] = useState(null);      // 已保存（服务器侧）的树，用于 dirty 判断
       const [isDefault, setIsDefault] = useState(true);
@@ -5172,6 +5400,7 @@ window.__ModuleLoader__.load({
         h('div', { className: 'wb-row', style: { justifyContent: 'space-between', marginBottom: 12 } },
           h('div', null,
             h('h2', { style: { margin: 0, fontSize: 18 } }, '文件夹模板'),
+            h('div', { className: 'wb-hint', style: { marginTop: 2, fontSize: 11, opacity: 0.55 } }, 'client ' + REV),
             h('div', { className: 'wb-hint', style: { marginTop: 4 } },
               '新建/绑定项目时按这棵树生成项目文件夹骨架。' + (dirty() ? '有未保存的修改。' : isDefault ? '当前为内置默认。' : '已保存自定义模板。')
               + ' 各被评估单位的 00财务资料 / 02基础类 / 03资产基础法 / 04收益法 / 05市场法 子目录按公司与评估方法自动补齐，不在这棵树里。')),
