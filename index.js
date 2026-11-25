@@ -3669,6 +3669,46 @@ export function apply(ctx) {
       },
     },
     {
+      // 从天源拉公司级资产基础法科目金额，喂给 /project/folders/build。
+      // POST /ty/ab-subjects { projectId, companies:[{ name, companyId }] }
+      //   → { ok, companies:[{ name, companyId, subjects:[{ name, amount, code }] }] }
+      // 用 get_company_asset_based_approach_summary（一次调用拿全部科目+账面/评估值），
+      // 只取 level=2 行（科目层，level 1 是大类合计、3 是明细）；金额取账面价值 bookValue，
+      // 评估值 appraisedValue 兜底；为 0 的科目不返回（建目录本来就只建有金额的）。
+      // 公司匹配靠前端把本地公司名对上天源公司（/ty/report-companies 已有清单）。
+      path: PREFIX + '/ty/ab-subjects', methods: ['POST'], fetch: async (req) => {
+        try {
+          const b = await req.json().catch(() => ({}));
+          const projectId = Number(b.projectId);
+          if (!Number.isFinite(projectId) || projectId <= 0) return json({ ok: false, error: 'projectId 必须为数字' }, 400);
+          const wanted = Array.isArray(b.companies) ? b.companies : [];
+          if (!wanted.length) return json({ ok: false, error: 'companies 为空' }, 400);
+          const out = [];
+          for (const c of wanted) {
+            const name = String((c && c.name) || '').trim();
+            const companyId = Number(c && c.companyId);
+            if (!name || !Number.isFinite(companyId) || companyId <= 0) continue;
+            const r = await ty.callTool('get_company_asset_based_approach_summary', { projectId, companyId });
+            const d = r && r.data;
+            if (!d || d.success === false) throw new Error(name + '：天源返回异常' + (d && d.error ? '（' + d.error + '）' : ''));
+            const rows = Array.isArray(d.rows) ? d.rows : [];
+            const subjects = rows
+              .filter(x => x && x.level === 2 && x.subjectName
+                && (Number(x.bookValue) || Number(x.appraisedValue) || 0) !== 0)
+              .map(x => ({
+                name: String(x.subjectName),
+                amount: Number(x.bookValue) || Number(x.appraisedValue) || 0,
+                code: String(x.subjectCode || ''),
+              }));
+            out.push({ name, companyId, subjects, companyName: String(d.companyName || name) });
+          }
+          return json({ ok: true, companies: out });
+        } catch (e) {
+          return json({ ok: false, error: String((e && e.message) || e).slice(0, 300) }, 502);
+        }
+      },
+    },
+    {
       // 项目文件夹模板：POST /project/folders/build { folder, companies:[{ name, methods:{whole,part}, subjects:[{name,amount}] }] }
       // 幂等：已存在的目录跳过，只报新建了多少。模板规则全在 folders.js（planProjectFolders）。
       path: PREFIX + '/project/folders/build', methods: ['POST'], fetch: async (req) => {

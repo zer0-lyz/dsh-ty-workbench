@@ -3010,6 +3010,55 @@ window.__ModuleLoader__.load({
           toast('生成失败：' + String((err && err.message) || err), 'warn');
         } finally { setBusy(''); }
       };
+      // 从天源同步当前公司的资产基础法科目金额（对接第 1 步）：
+      // /ty/report-companies 拿天源公司清单 → 名字归一化匹配 → /ty/ab-subjects 拉 level=2 非零科目
+      // → 合并进本地科目表（同名覆盖金额，本地独有保留）→ 顺手重建项目文件夹。
+      const normName = n => String(n || '').replace(/\s+/g, '').replace(/（/g, '(').replace(/）/g, ')').toLowerCase();
+      const syncTy = async () => {
+        if (!cur) return;
+        const tid = String((project && project.tyId) || '').trim();
+        if (!/^\d+$/.test(tid)) { toast('该项目还没绑定天源项目，先在项目行「绑定天源」', 'warn'); return; }
+        setBusy('sync');
+        try {
+          const rc = await fetch(PREFIX + '/ty/report-companies?projectId=' + encodeURIComponent(tid), { cache: 'no-store' });
+          const rcj = await rc.json().catch(() => ({}));
+          if (!rc.ok || !rcj.ok) throw new Error((rcj && rcj.error) || ('HTTP ' + rc.status));
+          const tyCos = Array.isArray(rcj.companies) ? rcj.companies : [];
+          const hit = tyCos.filter(c => normName(c && c.name) === normName(cur.name))[0]
+            || tyCos.filter(c => normName(c && c.name).indexOf(normName(cur.name)) >= 0 || normName(cur.name).indexOf(normName(c && c.name)) >= 0)[0];
+          if (!hit || !/^\d+$/.test(String((hit && hit.id) || ''))) throw new Error('天源项目里没找到同名公司「' + cur.name + '」，请核对两边公司名');
+          const r = await fetch(PREFIX + '/ty/ab-subjects', {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ projectId: tid, companies: [{ name: cur.name, companyId: hit.id }] }),
+          });
+          if (r.status === 404) throw new Error('宿主未重载，重启 DSH 后可用');
+          const d = await r.json().catch(() => ({}));
+          if (!r.ok || !d.ok) throw new Error((d && d.error) || ('HTTP ' + r.status));
+          const got = ((d.companies || [])[0] || {}).subjects || [];
+          if (!got.length) { toast('天源「' + (d.companyName || hit.name) + '」没有非零科目（先在天源把底稿汇总填好）', 'warn'); return; }
+          // 合并：天源科目覆盖本地同名单（金额以天源为准），本地独有的留在后面
+          const merged = subjects.slice();
+          let over = 0; let add = 0;
+          got.forEach(g => {
+            const nm = String(g.name || '').trim();
+            if (!nm) return;
+            const idx = merged.map(x => x.name).indexOf(nm);
+            if (idx >= 0) { merged[idx] = { name: nm, amount: String(g.amount == null ? '' : g.amount) }; over += 1; }
+            else { merged.push({ name: nm, amount: String(g.amount == null ? '' : g.amount) }); add += 1; }
+          });
+          finUpdate(project.id, cid, () => merged);
+          // patch 还没回流，手动拼最新 companies 重建目录（同 saveMethod 的做法）
+          const after = rows.map(r2 => ({
+            name: r2.name,
+            methods: r2.methods || { whole: [], part: [] },
+            subjects: r2.id === cid ? merged : finSubjects(s, project.id, r2.id).map(x => ({ name: x.name, amount: x.amount })),
+          })).filter(r2 => r2.name && r2.name !== '被评估单位');
+          await buildProjectFoldersFrom(project, after, toast, true);
+          toast('已从天源同步 ' + got.length + ' 个科目（覆盖 ' + over + '、新增 ' + add + '），项目文件夹已对齐', 'info');
+        } catch (err) {
+          toast('从天源同步失败：' + String((err && err.message) || err), 'warn');
+        } finally { setBusy(''); }
+      };
 
       if (!cur) {
         return h('div', null, h('p', { className: 'pf-hint' }, '还没有股权信息。先到「股权信息」里添加被评估单位和子公司，再回来录财务资料。'));
@@ -3021,6 +3070,7 @@ window.__ModuleLoader__.load({
               ? h('label', null, '公司', h('span', { className: 'pf-hint' }, cid ? (cur.code + ' ' + cur.name) : '—'))
               : h('label', null, '公司', h('select', { className: 'pf-sel', value: cid, onChange: e => setWho(e.target.value) }, rows.map(r => h('option', { key: r.id, value: r.id }, r.code + ' ' + r.name)))),
             h('button', { type: 'button', className: 'pf-btn', disabled: busy === 'import', onClick: () => fileRef.current && fileRef.current.click() }, busy === 'import' ? '读取中…' : '导入科目余额表'),
+            h('button', { type: 'button', className: 'pf-btn', title: '从绑定的天源项目拉这家公司资产基础法的非零科目（金额以天源为准，本地独有的科目保留）', disabled: busy === 'sync', onClick: syncTy }, busy === 'sync' ? '同步中…' : '从天源同步科目'),
             h('button', { type: 'button', className: 'pf-btn', onClick: clearAll }, '清空')),
           h('input', { type: 'file', accept: '.xlsx,.xlsm,.csv', ref: fileRef, style: { display: 'none' }, onChange: onFile }),
           h('div', { className: 'pw-acts' },
