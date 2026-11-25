@@ -3195,7 +3195,9 @@ window.__ModuleLoader__.load({
       { key: 'balance_sheet', name: '资产负债表', sheet: '资' },
       { key: 'income_statement', name: '利润表', sheet: '利' },
     ];
-    const fsEmptyStmt = () => ({ statementType: '', sheet: '', year: '', unit: '元', period: '', columns: [], rows: [], sheetData: null });
+    // byYear：本地按年度存的多期数据（「01财务报表」一次扫出来的各个年度都放这里），
+    // 上层字段（year/columns/rows/sheetData）始终指向最近一期，兼容老数据和单文件导入。
+    const fsEmptyStmt = () => ({ statementType: '', sheet: '', year: '', unit: '元', period: '', columns: [], rows: [], sheetData: null, byYear: {} });
     const fsOf = (s, pid, cid, mode) => {
       const c = ((finMapOf(s)[pid] || {}).companies || {})[cid] || {};
       const all = c.statements || {};
@@ -3323,7 +3325,9 @@ window.__ModuleLoader__.load({
           h('thead', null, h('tr', null, ['科目'].concat(per.map(p => p.label)).map((t, i) => h('th', { key: i }, String(t))))),
           h('tbody', null, list.map((n, i) => {
             const t = isTitle(n);
-            const hit = tyMemo ? tyMemo.get(String(n).replace(/\s/g, '')) : null;
+            // 天源模板里写作「减：库存股」「其中：…」，源表里常常只写「库存股」，两边都试一次
+            const key = String(n).replace(/\s/g, '');
+            const hit = tyMemo ? (tyMemo.get(key) || tyMemo.get(key.replace(/^(减|加|其中)[:：]/, ''))) : null;
             return h('tr', { key: i, style: t ? { background: 'rgba(47,127,240,.04)' } : null },
               h('td', { style: t ? { fontWeight: 600 } : null }, String(n)),
               per.map((p, j) => h('td', { key: j, style: { textAlign: 'right' } }, hit ? fmtv(hit[p.year]) : '')));
@@ -3337,7 +3341,6 @@ window.__ModuleLoader__.load({
       const [ty, setTy] = useState({ status: '', error: '', projects: [], companies: [] });
       const [mode, setMode] = useState('1');
       const [tab, setTab] = useState('balance_sheet');
-      const [pending, setPending] = useState(null);     // prepare 结果（待确认）
       const [result, setResult] = useState(null);       // get_reports 拉回来的结果
       const fileBalRef = useRef(null);
       const fileIncRef = useRef(null);
@@ -3389,7 +3392,7 @@ window.__ModuleLoader__.load({
       // 切到某家天源项目 → 拉它下面的公司
       const pickTyProject = async tyProjectId => {
         setTy(x => Object.assign({}, x, { companies: [] }));
-        setPending(null); setBatch(null); setAiNote(null);   // 换了天源项目，之前的确认 token 一律作废
+        setBatch(null); setAiNote(null);   // 换了天源项目，之前的确认 token 一律作废
         fsTop(project.id, cid, () => ({ tyProjectId: tyProjectId, tyCompanyId: '' }));
         if (!tyProjectId) return;
         try {
@@ -3418,10 +3421,15 @@ window.__ModuleLoader__.load({
           const got = list.filter(x => x.statementType === only)[0] || null;
           fsUpdate(project.id, cid, mode, b => {
             const next = Object.assign({}, b, { fileName: f.name, importedAt: new Date().toISOString() });
-            if (got) next[only] = Object.assign(fsEmptyStmt(), got);
+            if (got) {
+              const one = Object.assign(fsEmptyStmt(), got, { fileName: f.name, importedAt: new Date().toISOString() });
+              // 单文件导入也落进 byYear，跟「01财务报表」扫出来的一样，后面统一走「预检并写天源」
+              const byYear = Object.assign({}, b.byYear || {});
+              if (got.year) byYear[String(Number(got.year))] = one;
+              next[only] = Object.assign({}, one, { byYear });
+            }
             return next;
           });
-          setPending(null);
           setResult(null);
           if (got) setTab(only);
           if (got) toast('已读入' + (only === 'income_statement' ? '利润表' : '资产负债表') + '「' + (got.sheet || '') + '」' + (got.rows || []).length + ' 行（' + f.name + '）', 'info');
@@ -3587,19 +3595,94 @@ window.__ModuleLoader__.load({
           toast('AI 解析失败：' + String((e && e.message) || e), 'warn');
         } finally { setAiBusy(false); }
       };
-      // 批量预检：按报表类型分组，每种类型一次 prepare（sheetList 里放该类型的所有年度）
-      const prepareBatch = async () => {
-        const p = box.tyProjectId; const c = box.tyCompanyId;
-        if (!p || !c) { toast('先在右边选这家公司对应的天源项目和公司', 'warn'); return; }
+      // 把扫描/人工分类的期先落到本地报表（按年度存进 byYear），上面预览表立刻能逐期核对；
+      // 这一步不动天源，只有确认无误后再点下面的「预检并写天源」。
+      const applyScanToLocal = () => {
         const packs = ((scan && scan.packs) || []).filter(x => scanKeep[x.statementType + '@' + x.year]);
         if (!packs.length) { toast('没有勾选任何要导入的报表', 'warn'); return; }
+        const subj = {};
+        ['balance_sheet', 'income_statement'].forEach(st => {
+          const group = packs.filter(x => x.statementType === st).sort((a, b) => Number(a.year) - Number(b.year));
+          if (!group.length) return;
+          fsUpdate(project.id, cid, mode, b => {
+            const cur0 = b[st] || fsEmptyStmt();
+            const byYear = Object.assign({}, cur0.byYear || {});
+            group.forEach(x => {
+              byYear[String(Number(x.year))] = Object.assign(fsEmptyStmt(), {
+                statementType: st,
+                sheet: x.sheet || '',
+                year: Number(x.year),
+                unit: x.unit || '元',
+                period: x.period || '',
+                columns: x.columns || [],
+                rows: x.rows || [],
+                sheetData: x.sheetData || null,
+                fileName: x.fileName,
+                importedAt: new Date().toISOString(),
+              });
+            });
+            // 上层字段指向最新一期，保持「单文件导入」那套渲染/预检仍然可用
+            const years = Object.keys(byYear).map(Number).sort((a, b) => b - a);
+            const latest = byYear[String(years[0])] || fsEmptyStmt();
+            (latest.sheetData || {}).detail && (latest.sheetData.detail || []).forEach(d => {
+              if (d.amount) subj[String(d.originName || d.subjectName || '').replace(/\s/g, '')] = true;
+            });
+            return Object.assign({}, b, {
+              [st]: Object.assign({}, cur0, latest, { byYear }),
+            });
+          });
+        });
+        // 资产负债表里读到的科目名并入公司科目，底稿文件夹跟着建
+        const names = Object.keys(subj).filter(Boolean);
+        if (names.length) {
+          patch('work', w => {
+            const all = Object.assign({}, w.finance || {});
+            const proj = Object.assign({ companies: {} }, all[project.id] || {});
+            const comps = Object.assign({}, proj.companies || {});
+            const comp = Object.assign({ subjects: [] }, comps[cid] || {});
+            const have = new Set((comp.subjects || []).map(x => String(x.name || x).replace(/\s/g, '')));
+            const add = names.filter(n => !have.has(n)).map(n => ({ name: n }));
+            comps[cid] = Object.assign({}, comp, { subjects: (comp.subjects || []).concat(add) });
+            proj.companies = comps;
+            all[project.id] = proj;
+            return Object.assign({}, w, { finance: all });
+          });
+        }
+        const ys = packs.map(x => x.statementType === 'income_statement' ? '利' : '资').join('');
+        toast('已写入本地报表 ' + packs.length + ' 张表（' + packs.map(x => x.year).join('/') + '），先在下面逐期核对，没问题再点「预检并写天源」', 'info');
+      };
+
+      // 把「本地已存的各期报表」推到天源：每种报表类型一次 prepare（sheetList 装该类型所有年度），
+      // 预检通过后再一次确认全部写入。数据来源是本地 byYear，也就是上面预览表给人核对的那份。
+      const prepareBatch = async () => {
+        const p = box.tyProjectId; const c = box.tyCompanyId;
+        if (!p || !c) {
+          toast('还不能写天源：先在右上角「天源项目」「公司」两个下拉里选好，再点这个按钮（本地报表已经存好了，不会丢）', 'warn');
+          return;
+        }
+        const picks = [];
+        ['balance_sheet', 'income_statement'].forEach(st => {
+          const boxSt = fsOf(s, project.id, cid, mode)[st] || fsEmptyStmt();
+          const byYear = boxSt.byYear || {};
+          Object.keys(byYear).map(Number).sort((a, b) => a - b).forEach(y => {
+            const ent = byYear[String(y)] || {};
+            if (ent.sheetData) picks.push({ statementType: st, year: Number(y), sheetData: ent.sheetData });
+          });
+        });
+        if (!picks.length) { toast('本地还没有可导入的报表，先点上面的「从「01财务报表」导入」把报表读进来', 'warn'); return; }
         setBusy('batch');
         setBatch(null);
         const runs = []; const errs = [];
         for (const st of ['balance_sheet', 'income_statement']) {
-          const group = packs.filter(x => x.statementType === st);
+          const group = picks.filter(x => x.statementType === st);
           if (!group.length) continue;
-          const sheets = group.map(x => Object.assign({}, x.sheetData, { reportYear: Number(x.year) || null }));
+          // skipSummary 是本地展示用的字段（把 skipped 分成 零/明细/金融 三类给人看），
+          // 天源的 sheetList schema 里没有它，别一起发过去（多一个字段可能整单被拒）。
+          const sheets = group.map(x => {
+            const src = Object.assign({}, x.sheetData, { reportYear: Number(x.year) || null });
+            delete src.skipSummary;
+            return src;
+          });
           try {
             const d = await call('prepare_financial_statement_report_import', {
               projectId: Number(p), companyId: Number(c),
@@ -3661,49 +3744,6 @@ window.__ModuleLoader__.load({
         if (done.length) { try { await refreshReports(); } catch (e) {} }
       };
 
-      // 两步走：先 prepare（天源只校验不保存），用户看过金额再 execute
-      const prepare = async () => {
-        const p = box.tyProjectId; const c = box.tyCompanyId;
-        if (!p || !c) { toast('先在右边选这家公司对应的天源项目和公司', 'warn'); return; }
-        if (!sd.sheetData || fsIsTyOnly(sd)) { toast('这个页签还没有本地数据，先点上面的「导入' + fsTypeName(tab) + '」', 'warn'); return; }
-        setBusy('prepare');
-        try {
-          const year = Number(sd.year) || null;
-          const sheet = Object.assign({}, sd.sheetData, { reportYear: year });
-          const args = {
-            projectId: Number(p), companyId: Number(c),
-            statementType: sd.statementType, reportMode: Number(mode),
-            missingSubjectPolicy: 'preserve_existing', includeRequestBody: false,
-            sheetList: [sheet],
-          };
-          const d = await call('prepare_financial_statement_report_import', args);
-          if (!d || !d.success) {
-            const errs = (d && d.validationErrors) || [];
-            throw new Error((d && (d.error || d.message)) || '预检未通过' + (errs.length ? '：' + errs.slice(0, 3).map(x => (x.originName || x.subjectName) + '（' + (x.error || '对不上模板') + '）').join('；') : ''));
-          }
-          setPending({ statementType: sd.statementType, token: d.confirmationToken, prompt: d.confirmationPrompt, dataPrompt: d.confirmationDataPrompt, preview: d.preview, expiresAt: d.expiresAt, mode: Number(mode) });
-        } catch (err) {
-          toast('预检失败：' + String((err && err.message) || err), 'warn');
-        } finally { setBusy(''); }
-      };
-      const execute = async () => {
-        if (!pending) return;
-        setBusy('execute');
-        try {
-          const d = await call('execute_financial_statement_report_import', { confirmationToken: pending.token, confirmed: true });
-          if (!d || !(d.success || d.ok)) throw new Error((d && (d.error || d.message)) || '保存失败');
-          const pv = pending.preview || {};
-          fsUpdate(project.id, cid, pending.mode, b => Object.assign({}, b, {
-            lastResult: { at: new Date().toISOString(), statementType: pending.statementType, mode: pending.mode, prompt: pending.prompt, summary: ((pv.sheets || [])[0]) || null, message: (d && (d.message || (d.data && d.data.message))) || '已保存到天源' },
-          }));
-          setPending(null);
-          toast('已写入天源：' + (pv.statementName || fsTypeName(pending.statementType)) + '（' + (pv.reportModeName || fsModeName(pending.mode)) + '）', 'info');
-          await refreshReports();
-        } catch (err) {
-          toast('保存失败：' + String((err && err.message) || err), 'warn');
-        } finally { setBusy(''); }
-      };
-
       // 「查看天源已导入XX表」：只拉当前页签这一种报表、当前口径，命中的已有年度用天源数据填进表里；
       // 天源这一口径一期都没有的时候，按模板列一张空白报表，方便照着填、核对。
       const refreshReports = async () => {
@@ -3730,10 +3770,9 @@ window.__ModuleLoader__.load({
               next[st] = Object.assign(fsEmptyStmt(), {
                 statementType: st, tyOnly: true, year: years[0] || '', period: '', fileName: '',
                 columns: years.map(y => ({ label: y, kind: 'ty' })), rows: [],
-              });
+              }, { byYear: (b[st] || {}).byYear || {} });   // 本地扫的那几期留着，别一刷新就丢
               return next;
             });
-            setPending(null);
             toast('天源「' + fsModeName(mode) + fsTypeName(st) + '」还没有数据，已按模板列出空白报表', 'info');
           } else {
             fsUpdate(project.id, cid, mode, b => {
@@ -3742,7 +3781,7 @@ window.__ModuleLoader__.load({
                 statementType: st, tyOnly: true, tyMode: String(mode), year: years[0],
                 period: '天源 ' + fsModeName(mode) + ' 已导入年度 ' + years.join('/'),
                 fileName: '', columns: years.map(y => ({ label: y, kind: 'ty' })), rows: [],
-              });
+              }, { byYear: (b[st] || {}).byYear || {} });
               return next;
             });
             toast('已取天源『' + fsModeName(mode) + fsTypeName(st) + '』：已有年度 ' + years.join('/'), 'info');
@@ -3761,7 +3800,7 @@ window.__ModuleLoader__.load({
           balance_sheet: fsEmptyStmt(),
           income_statement: fsEmptyStmt(),
         }));
-        setPending(null); setResult(null);
+        setResult(null);
         toast('已清空「' + cur.name + '」' + fsModeName(mode) + '口径的资产负债表与利润表', 'info');
       };
       // 从天源同步当前公司的资产基础法科目金额（对接第 1 步）：
@@ -3925,7 +3964,23 @@ window.__ModuleLoader__.load({
         const id = c.id || c.companyId;
         return h('option', { key: 'c' + id, value: String(id) }, c.name || c.companyName || '');
       });
-      const previewRows = (pending && pending.preview && (pending.preview.sheets || [])[0] && (pending.preview.sheets || [])[0].amountPreview) || [];
+      // 本地已存的各期（「01财务报表」一次扫出来多期时都在 byYear 里），按年度倒序
+      const localByYear = sd.byYear || {};
+      const localYears = Object.keys(localByYear).map(Number).filter(y => y > 0).sort((a, b) => b - a);
+      // 把本地多期摊成 「天源科目 → {年度: 金额}」，直接复用 fsBlankTable 的列渲染
+      const localMemo = new Map();
+      localYears.forEach(y => {
+        const ent = localByYear[String(y)] || {};
+        ((ent.sheetData || {}).detail || []).forEach(d => {
+          const nm = String(d.subjectName || '').replace(/\s/g, '');
+          if (!nm) return;
+          const tgt = localMemo.get(nm) || {};
+          const v = Number(d.amount);
+          if (!Number.isNaN(v)) tgt[String(y)] = v;
+          localMemo.set(nm, tgt);
+        });
+      });
+      const localPeriods = localYears.map(y => ({ year: y, kind: 'now', label: String(y) + '-12-31' }));
       const reportRows = ((result && result.reports) || []).reduce((acc, r) => acc.concat((r.worksheetRows || []).filter(w => { const vs = w.values || {}; return Object.keys(vs).some(k => vs[k] != null && vs[k] !== 0); }).map(w => Object.assign({}, w, { _years: Object.keys(w.values || {}).sort().reverse() }))), []).slice(0, 200);
       // 扫描结果里「认不出的页」：让人工指定这页是资产负债表还是利润表
       const kindOptions = m => ['', 'balance', 'income', 'skip'].map(v => h('option', { key: v || 'none', value: v },
@@ -4035,12 +4090,21 @@ window.__ModuleLoader__.load({
         ? h('p', { className: 'pf-hint', style: { marginTop: 6 } }, '同期有多个文件，只导入后者：'
           + scan.conflicts.map(c => (c.statementType === 'income_statement' ? '利润表' : '资产负债表') + c.year + ' 用 ' + c.kept + '（忽略 ' + c.dropped + '）').join('；'))
         : null;
+      // 表头年份经常是错的（企业直接把去年的表改个名字），扫描器按文件名纠正了年度；
+      // 这里把纠正过的逐条列出来，免得用户以为年度认错了。
+      const yearNoticeBox = (scan && (scan.yearNotes || []).length)
+        ? h('p', { className: 'pf-hint', style: { marginTop: 6, color: '#c96a00' } }, '年度按文件名纠正：'
+          + scan.yearNotes.map(n => (n.statementType === 'income_statement' ? '利润表' : '资产负债表') + ' ' + n.fileName + ' 表头写 ' + n.from + '，按文件名取 ' + n.to).join('；')
+          + '。表头不一定可信，请在上面核对年度对不对，不对就改文件名里的年份再重新扫描。')
+        : null;
       const scanBox = scan
         ? h('div', { className: 'pf-card', style: { marginTop: 10 } },
           h('p', null, h('b', null, '「01财务报表」里扫到 ' + (scan.files || []).length + ' 个文件、' + (scan.packs || []).length + ' 张报表')),
+          h('p', { className: 'pf-hint' }, '流程：① 勾要哪几期 → ②「写入本地报表」（只存本机，不碰天源）→ ③ 在上面逐期核对金额 → ④ 点右边底部「预检并写天源」，确认后再落库。'),
           h('p', { className: 'pf-hint' }, '目录：' + (scan.rel || '') + '（点下面「打开报表文件夹」把各期报表放进去，再点「重新扫描」）'),
           needManualBox,
           aiBox,
+          yearNoticeBox,
           packBox,
           conflictBox,
           h('div', { className: 'pw-acts', style: { marginTop: 6 } },
@@ -4048,10 +4112,11 @@ window.__ModuleLoader__.load({
             h('button', { type: 'button', className: 'pf-btn', onClick: () => openSub(financeStatementsFolderOf(cur.name)) }, '打开报表文件夹'),
             h('button', {
               type: 'button', className: 'pf-btn pri',
-              disabled: busy === 'batch' || !(scan.packs || []).some(p => scanKeep[p.statementType + '@' + p.year]),
-              onClick: prepareBatch,
-            }, busy === 'batch' ? '预检中…' : '预检选中各期（一次写天源）'),
-            h('button', { type: 'button', className: 'pf-btn', onClick: () => { setScan(null); setBatch(null); } }, '收起')))
+              disabled: !(scan.packs || []).some(p => scanKeep[p.statementType + '@' + p.year]),
+              onClick: applyScanToLocal,
+            }, '写入本地报表（' + ((scan.packs || []).filter(p => scanKeep[p.statementType + '@' + p.year]).length) + ' 张）'),
+            h('button', { type: 'button', className: 'pf-btn', onClick: () => { setScan(null); setBatch(null); } }, '收起')),
+          h('p', { className: 'pf-hint', style: { marginTop: 4 } }, '「写入本地报表」只存到这台机器的工作台里，不碰天源；写完在上面逐期核对，确认无误再点下面的「预检并写天源」。'))
         : null;
       // 批量预检结果：一次确认写全部
       const batchRunBox = (r, i) => {
@@ -4076,6 +4141,15 @@ window.__ModuleLoader__.load({
           h('b', null, '✗ ' + (e.statementType === 'income_statement' ? '利润表' : '资产负债表') + '：'), e.error,
           (e.details || []).length ? h('span', null, '（' + e.details.join('；') + '）') : null)))
         : null;
+      // 要写天源就必须先选定天源项目 + 天源公司。没选时不能只闪一条 toast（用户会以为界面坏了），
+      // 而是在「预检并写天源」旁边常驻一条提示，说清差哪一步、去哪儿选。
+      const tyReady = !!(box.tyProjectId && box.tyCompanyId);
+      const tyHintBox = tyReady ? null
+        : h('p', { className: 'pf-hint', style: { marginTop: 8, color: '#c96a00' } },
+            '还不能写天源：' + (box.tyProjectId ? '' : '先在右上角「天源项目」里选项目') +
+            (box.tyProjectId ? '' : (box.tyCompanyId ? '' : '，')) +
+            (box.tyCompanyId ? '' : '再在「公司」里选对应的天源公司') +
+            '。本地报表已经存好了，选完这两项再点「预检并写天源」。');
       const batchBox = batch
         ? h('div', { className: 'pf-card', style: { marginTop: 10 } },
           h('p', null, h('b', null, (batch.errors || []).length ? '预检结果（有未通过的）' : '天源预检通过，请核对后一次保存全部：')),
@@ -4100,7 +4174,7 @@ window.__ModuleLoader__.load({
             h('button', { type: 'button', className: 'pf-btn', title: '从绑定的天源项目拉这家公司资产基础法的非零科目（金额以天源为准，本地独有的科目保留）', disabled: busy === 'sync', onClick: syncTy }, busy === 'sync' ? '同步中…' : '从天源同步科目'),
             h('button', { type: 'button', className: 'pf-btn', title: '把天源这家公司「资产基础法/*/查证资料（含盘点/担保/科目通用文件/其他）」的文件下载到本地对应科目夹', disabled: busy === 'pull', onClick: pullFiles }, busy === 'pull' ? '拉取中…' : '拉查证资料'),
             h('button', { type: 'button', className: 'pf-btn', onClick: clearAll }, '清空')),
-            h('label', null, '报表口径', h('select', { className: 'pf-sel', value: mode, onChange: e => { setMode(e.target.value); setPending(null); setResult(null); setBatch(null); setAiNote(null); } },
+            h('label', null, '报表口径', h('select', { className: 'pf-sel', value: mode, onChange: e => { setMode(e.target.value); setResult(null); setBatch(null); setAiNote(null); } },
               h('option', { value: '1' }, '单体'), h('option', { value: '2' }, '合并')),
             h('label', { title: baseDate ? ('从评估基准日 ' + baseDate + ' 所在年度往前推') : '项目里还没填评估基准日' }, '报表显示期数',
               h('select', { className: 'pf-sel', value: String(nPeriods), onChange: e => setPeriods(e.target.value) },
@@ -4129,66 +4203,76 @@ window.__ModuleLoader__.load({
               h('option', { value: '' }, ty.status === 'on' ? '选择天源项目' : (ty.status === 'loading' ? '连接中…' : '天源未连接')),
               tyOpts),
             h('span', { className: 'pf-hint' }, '公司 '),
-            h('select', { className: 'pf-sel', style: { maxWidth: 260 }, value: String(box.tyCompanyId || ''), onChange: e => { fsTop(project.id, cur.id, () => ({ tyCompanyId: e.target.value })); setPending(null); setBatch(null); setAiNote(null); } },
+            h('select', { className: 'pf-sel', style: { maxWidth: 260 }, value: String(box.tyCompanyId || ''), onChange: e => { fsTop(project.id, cur.id, () => ({ tyCompanyId: e.target.value })); setBatch(null); setAiNote(null); } },
               h('option', { value: '' }, '选择天源公司'), tyCOpts))),
         // ── 页签：资产负债表 / 利润表
         h('div', { className: 'pw-tabs' },
           FS_TYPES.map(t => {
             const st = box[t.key] || fsEmptyStmt();
-            return h('button', { key: t.key, type: 'button', className: 'pf-btn sm' + (tab === t.key ? ' pri' : ''), onClick: () => { setTab(t.key); setPending(null); setResult(null); } },
-              t.name + (st.sheetData ? '（' + (st.year || '') + '）' : ''));
+            // 页签上把本地存到的所有年度都列出来（一次扫了 2024/2025 两期时，一眼能看到两期都在）
+            const lys = Object.keys((st.byYear || {})).map(Number).filter(y => y > 0).sort((a, b) => a - b);
+            const tag = lys.length ? '（' + lys.join('/') + '）' : (st.sheetData ? '（' + (st.year || '') + '）' : '');
+            return h('button', { key: t.key, type: 'button', className: 'pf-btn sm' + (tab === t.key ? ' pri' : ''), onClick: () => { setTab(t.key); setResult(null); } },
+              t.name + tag);
           }),
-          h('span', { className: 'pf-hint' }, sd.sheetData
-            ? (fsIsTyOnly(sd) ? '天源「' + fsTypeName(tab) + '」（' + fsModeName(box.tyMode || mode) + '），还没有导入本地文件' : ('本地文件：' + (sd.fileName || '') + (sd.sheet ? ' · 「' + sd.sheet + '」' : '') + (sd.period ? ' · ' + sd.period : '')))
-            : '这个页签还没有导入，下面是天源' + fsTypeName(tab) + '的空白报表（可照着填、核对）')),
+          h('span', { className: 'pf-hint' }, fsIsTyOnly(sd)
+            ? ('天源「' + fsTypeName(tab) + '」（' + fsModeName(box.tyMode || mode) + '）的现有数' + (result.report ? '，天源已有年度 ' + ((result.report.existingYears || []).join('/') || '无') : ''))
+            : (sd.sheetData
+              ? ((localYears.length > 1 ? '本地 ' + localYears.length + ' 期：' : '本地文件：') + (localYears.length > 1 ? localYears.join('/') : ((sd.fileName || '') + (sd.sheet ? ' · 「' + sd.sheet + '」' : '') + (sd.period ? ' · ' + sd.period : ''))))
+              : '这个页签还没有导入，下面是天源' + fsTypeName(tab) + '的空白报表（可照着填、核对）'))),
         // ── 预览表：源表科目 → 天源科目 → 金额；没导入过就按天源模板列一份空白报表
         h('div', null,
-          h('p', { className: 'pf-hint' }, fsIsTyOnly(sd)
-            ? ('天源现有 ' + ((result.tyRows || []).length) + ' 个科目' + (result.report ? ('，已有年度 ' + ((result.report.existingYears || []).join('/') || '无') + '，可导入年度 ' + ((result.report.missingYears || []).join('/') || '无')) : '') + '。')
-            : (sd.sheetData
+          h('p', { className: 'pf-hint' }, (localYears.length && !fsIsTyOnly(sd))
+            ? ('本地已存 ' + localYears.length + ' 期（' + localYears.join('/') + '），下面是逐期明细，核对无误再点「预检并写天源」；要改哪一期就回上面重新扫描。')
+            : (fsIsTyOnly(sd)
+              ? ('天源现有 ' + ((result.tyRows || []).length) + ' 个科目' + (result.report ? ('，已有年度 ' + ((result.report.existingYears || []).join('/') || '无') + '，可导入年度 ' + ((result.report.missingYears || []).join('/') || '无')) : '') + '。')
+              : (sd.sheetData
               ? ('本地文件可写入天源 ' + ((sd.sheetData.detail || []).length) + ' 个科目' + (((sd.sheetData.skipped || []).length) ? ('，跳过 ' + sd.sheetData.skipped.length + ' 行（' + ((sd.sheetData.skipSummary || ['天源模板里没有对应科目']).join('；')) + '）') : '')
                 + (tot['资产总计'] != null ? '；资产总计 ' + fmt(tot['资产总计']) + '，负债+权益 ' + fmt((tot['负债合计'] || 0) + (tot['所有者权益合计'] || 0)) : '')
                 + (((sd.sheetData.duplicates || []).length) ? '；重复挂同一科目 ' + sd.sheetData.duplicates.length + ' 处（保留第一处）' : ''))
-              : '下面按天源模板列出' + fsTypeName(tab) + '的全部科目，金额列按「报表显示期数」排出 ' + periods.map(p => p.year + '-12-31').join('、') + '；点上面「导入' + fsTypeName(tab) + '」读入本地文件后按所属年度填上，没有数据的年度显示「—」。')),
-          sd.sheetData && !fsIsTyOnly(sd)
-            ? h('div', { className: 'pf-table-wrap', style: { maxHeight: 360, overflow: 'auto' } },
-              h('table', { className: 'pf-grid pw-grid' },
-                h('thead', null, h('tr', null, ['源表科目', '天源科目'].concat(periods.map(p => p.label)).map((t, i) => h('th', { key: i }, t)))),
-                h('tbody', null, (sd.sheetData.detail || []).map((r, i) => {
-                  const src = (sd.rows || []).filter(x => String(x.name).replace(/\s/g, '') === String(r.originName).replace(/\s/g, ''))[0] || null;
-                  const vals = src
-                    ? periods.map(p => (p.kind === 'now' ? (src.values || [])[0] : (p.kind === 'prev' ? (src.values || [])[1] : undefined)))
-                    : periods.map(p => (p.kind === 'now' ? r.amount : undefined));
-                  return h('tr', { key: i },
-                    h('td', null, r.originName),
-                    h('td', null, r.subjectName),
-                    vals.map((v, j) => h('td', { key: j, style: { textAlign: 'right' } }, fmt(v))));
-                }))))
-            : fsBlankTable(tab, fsIsTyOnly(sd) ? ((result.tyRows || []).map(w => w.subjectName)) : null, periods, tyMemo)),
+                : '下面按天源模板列出' + fsTypeName(tab) + '的全部科目，金额列按「报表显示期数」排出 ' + periods.map(p => p.year + '-12-31').join('、') + '；点上面「导入' + fsTypeName(tab) + '」读入本地文件后按所属年度填上，没有数据的年度显示「—」。'))),
+          // 本地已存了多期（从「01财务报表」一次导入各期）就按年度列出来逐期核对，这是写天源前的唯一凭据
+          (localYears.length && !fsIsTyOnly(sd))
+            ? fsBlankTable(tab, null, localPeriods, localMemo)
+            : (sd.sheetData && !fsIsTyOnly(sd)
+              ? h('div', { className: 'pf-table-wrap', style: { maxHeight: 360, overflow: 'auto' } },
+                h('table', { className: 'pf-grid pw-grid' },
+                  h('thead', null, h('tr', null, ['源表科目', '天源科目'].concat(periods.map(p => p.label)).map((t, i) => h('th', { key: i }, t)))),
+                  h('tbody', null, (sd.sheetData.detail || []).map((r, i) => {
+                    const src = (sd.rows || []).filter(x => String(x.name).replace(/\s/g, '') === String(r.originName).replace(/\s/g, ''))[0] || null;
+                    const vals = src
+                      ? periods.map(p => (p.kind === 'now' ? (src.values || [])[0] : (p.kind === 'prev' ? (src.values || [])[1] : undefined)))
+                      : periods.map(p => (p.kind === 'now' ? r.amount : undefined));
+                    return h('tr', { key: i },
+                      h('td', null, r.originName),
+                      h('td', null, r.subjectName),
+                      vals.map((v, j) => h('td', { key: j, style: { textAlign: 'right' } }, fmt(v))));
+                  }))))
+              : fsBlankTable(tab, fsIsTyOnly(sd) ? ((result.tyRows || []).map(w => w.subjectName)) : null, periods, tyMemo))),
         // ── 从「01财务报表」文件夹批量导入：扫描结果 / 人工分类 / 一次确认
         scanBox,
         // ── 批量预检结果：一次确认写全部
         batchBox,
         // ── 写天源 / 查看天源
         h('div', { className: 'pw-acts', style: { marginTop: 10 } },
-          h('button', { type: 'button', className: 'pf-btn pri', disabled: !sd.sheetData || fsIsTyOnly(sd) || busy === 'prepare', onClick: prepare }, busy === 'prepare' ? '预检中…' : '预检并写天源（' + (mode === '2' ? '合并' : '单体') + '）'),
+          h('button', {
+            type: 'button', className: 'pf-btn pri',
+            disabled: busy === 'batch' || (!localYears.length && (!sd.sheetData || fsIsTyOnly(sd))),
+            onClick: prepareBatch,
+          }, busy === 'batch' ? '预检中…' : ('预检并写天源（' + (mode === '2' ? '合并' : '单体') + (localYears.length ? ' · ' + localYears.join('/') : '') + '）')),
           h('button', { type: 'button', className: 'pf-btn', disabled: busy === 'refresh', onClick: refreshReports }, busy === 'refresh' ? '读取中…' : '查看天源已导入' + fsTypeName(tab)),
-          h('button', { type: 'button', className: 'pf-btn', onClick: () => openSub(financeFolderOf(cur.name)) }, '打开财务资料文件夹')),
-        pending
-          ? h('div', { className: 'pf-card', style: { marginTop: 8 } },
-            h('p', null, h('b', null, '天源预检通过，请核对后确认保存：')),
-            h('p', { className: 'pf-hint' }, pending.prompt || ''),
-            h('p', { className: 'pf-hint' }, pending.dataPrompt || ''),
-            h('div', { className: 'pf-table-wrap', style: { maxHeight: 220, overflow: 'auto' } },
-              h('table', { className: 'pf-grid pw-grid' },
-                h('thead', null, h('tr', null, ['年度', '科目', '金额'].map((t, i) => h('th', { key: i }, t)))),
-                h('tbody', null, previewRows.map((r, i) => h('tr', { key: i }, h('td', null, String((pending.preview.sheets || [])[0].reportYear)), h('td', null, r.subjectName), h('td', null, fmt(r.amount))))))),
-            h('div', { className: 'pw-acts' },
-              h('button', { type: 'button', className: 'pf-btn pri', disabled: busy === 'execute', onClick: execute }, busy === 'execute' ? '保存中…' : '确认保存到天源'),
-              h('button', { type: 'button', className: 'pf-btn', onClick: () => setPending(null) }, '取消')))
-          : box.lastResult
-            ? h('p', { className: 'pf-hint', style: { marginTop: 8 } }, '上次导入：' + (box.lastResult.statementType === 'income_statement' ? '利润表' : '资产负债表') + ' · ' + (box.lastResult.mode === 2 ? '合并' : '单体') + ' · ' + String(box.lastResult.at || '').slice(0, 19).replace('T', ' ') + (box.lastResult.summary ? (' · 写入 ' + box.lastResult.summary.importedSubjectCount + ' 个科目') : ''))
-            : null);
+          h('button', { type: 'button', className: 'pf-btn', onClick: () => openSub(financeFolderOf(cur.name)) }, '打开财务资料文件夹'),
+          localYears.length ? h('button', {
+            type: 'button', className: 'pf-btn danger',
+            onClick: () => {
+              if (!window.confirm('清掉本地已存的 ' + localYears.length + ' 期报表？天源上已经导入的不会动。')) return;
+              fsUpdate(project.id, cid, mode, b => ({ balance_sheet: Object.assign(fsEmptyStmt(), { sheetData: null }), income_statement: Object.assign(fsEmptyStmt(), { sheetData: null }) }));
+            },
+          }, '清空本地报表') : null),
+        tyHintBox,
+        box.lastResult
+          ? h('p', { className: 'pf-hint', style: { marginTop: 8 } }, '上次导入：' + (box.lastResult.statementType === 'income_statement' ? '利润表' : '资产负债表') + ' · ' + (box.lastResult.mode === 2 ? '合并' : '单体') + ' · ' + String(box.lastResult.at || '').slice(0, 19).replace('T', ' ') + (box.lastResult.summary ? (' · 写入 ' + box.lastResult.summary.importedSubjectCount + ' 个科目') : ''))
+          : null);
     }
 
     // 管理类底稿：一个项目一套，落在 03评估底稿/管理类底稿/<分类>。
@@ -5453,148 +5537,280 @@ window.__ModuleLoader__.load({
       return out.join('\n').trim();
     }
 
-    // ---------- 文件夹模板 · 参数设定页 ----------
-    // 目录树的可视化管理：增删改任意层级目录，保存后 /project/folders/build 就按它建骨架。
     // 数据契约见 folder-template.js：{ version:1, groups:[{ name, children:[…] }] }，层级≤5、目录≤400。
-    function FolderTemplatePage({ toast, onDirtyChange, tpl: tplProp, setTpl, saved: savedProp, setSaved, ui, setUi }) {
-      const REV = 'r20261126-0020';   // 版本标记：显示在页头，用于确认面板加载的是哪一代 client.js
-      // 状态全部提升到 WorkbenchPage（宿主 shim 对子组件 setState 重渲染不可靠，见 WorkbenchPage 注释）。
-      // 这里 tpl/saved/ui 只是 prop 的短别名；loadLoading 放在模块级闭包外的可变槽（组件重挂也不重复请求）。
-      const tpl = tplProp; const saved = savedProp;
-      const isDefault = !!(ui && ui.isDefault);
-      const busy = !!(ui && ui.busy);
-      const loadError = (ui && ui.loadError) || null;
-      const confirmDel = (ui && ui.confirmDel) || '';
-      // 函数式更新拿最新 prev 合并——patchUi 若用渲染闭包里的 ui，同一周期连发两次会丢前一次字段。
-      const patchUi = p => setUi(prev => Object.assign({}, prev, p));
-      let loadLoading = FolderTemplatePage.__loading === true;
-      const load = async () => {
-        if (loadLoading) return;
-        FolderTemplatePage.__loading = true;
-        patchUi({ busy: true, loadError: null });
-        try {
-          const r = await fetch(PREFIX + '/project/folders/template');
-          const d = await r.json().catch(() => ({}));
-          if (!r.ok || d.error) throw new Error(String(d.error || ('HTTP ' + r.status)));
-          setTpl(d.template); setSaved(d.template); patchUi({ isDefault: !!d.isDefault, busy: false, loadError: null });
-          if (onDirtyChange) onDirtyChange(false);
-        } catch (e) {
-          // 读不到不再卡死：用内置骨架兜底，页面保持可编辑（保存/恢复默认走服务器，成功即纠正）。
-          patchUi({ loadError: String((e && e.message) || e) });
-          setTpl({ version: 1, groups: NEW_FOLDER_PREVIEW.map(g => ({ name: g.name, children: g.children.map(c => ({ name: c, children: [] })) })) });
-          setSaved(null); patchUi({ isDefault: true, busy: false });
-          if (onDirtyChange) onDirtyChange(false);
-        }
-        FolderTemplatePage.__loading = false;
-        patchUi({ busy: false });
-      };
-      // 兼容宿主 React 精简 shim：依赖数组 [] 的 effect 可能不触发（或错误边界重挂后不跑）。
-      // 改为每次渲染后检查一次；load 内部用 loading 标志防重入，tpl 到手后不再重复请求。
-      useEffect(() => {
-        if (!tpl && !busy && !loadLoading) load();
+    // ---------- 文件夹模板 · 参数设定页（纯 DOM 实现，不依赖 React 状态）----------
+    // 宿主用的是精简版 React shim：子组件 setState 不重渲染、带依赖数组的 useEffect 可能不跑、
+    // 换成受控 props 提升状态也不保证子组件更新（三轮实测）。所以这个页面完全绕开 React：
+    //   · 数据与 UI 状态放在模块级 FTPL 里，翻页签/重挂都不丢；
+    //   · 控件用 document.createElement 递归建树，事件直接 addEventListener；
+    //   · React 只渲染一个空挂载点 #ftpl-root，每次渲染后 setTimeout(0) 补挂（不依赖 useEffect）。
+    // 唯一还需要 React 的两件事：toast（顶层 setState 生效）和 onDirtyChange（离页提示）。
+    const FTPL = {
+      tpl: null, saved: null, isDefault: true, busy: false, loadError: null,
+      confirmDel: '', loading: false, loaded: false, ctx: null, rev: 'r20261126-0040',
+      mountScheduled: false, dropTimer: null, notifyTimer: null,
+    };
+    function ftplEl(tag, props, children) {
+      const n = document.createElement(tag);
+      if (props) Object.keys(props).forEach(k => {
+        const v = props[k];
+        if (v == null || v === false) return;
+        if (k === 'class') n.className = v;
+        else if (k === 'text') n.textContent = v;
+        else if (k === 'style') Object.assign(n.style, v);
+        else if (k === 'disabled') n.disabled = !!v;
+        else if (k.slice(0, 2) === 'on' && typeof v === 'function') n.addEventListener(k.slice(2), v);
+        else n.setAttribute(k, String(v));
       });
-      const dirty = () => JSON.stringify(tpl) !== JSON.stringify(saved);
-      const edit = updater => {
-        // 不在 setTpl 的 updater 里调 onDirtyChange（那是在渲染阶段调父组件 setState，会告警/竞态）。
-        if (!tpl) return;
-        const next = updater(JSON.parse(JSON.stringify(tpl)));
-        setTpl(next);
-        if (onDirtyChange) onDirtyChange(JSON.stringify(next) !== JSON.stringify(saved));
-      };
-      // path 形如 ['groups', i, 'children', j, …]，成对出现（键名, 下标）。直接定位节点本身，
-      // 避免「把 node.children 当 siblings 传给 mutator」这类错位；节点可能没有 children 键
-      // （内置默认的三级叶子是 { name } 裸节点），沿路顺手补空数组。
-      const nodeAt = (groups, path) => {
-        let node = null;
-        for (let k = 1; k < path.length; k += 2) {
-          const arr = k === 1 ? groups : (node ? (Array.isArray(node.children) ? node.children : (node.children = [])) : null);
-          if (!arr || !arr[path[k]]) return null;
-          node = arr[path[k]];
-        }
-        return node;
-      };
-      const siblingsAt = (groups, path) => {
-        if (path.length === 2) return groups;                       // 一级目录的兄弟就是 groups
-        const parent = nodeAt(groups, path.slice(0, -2));
-        if (!parent) return null;
-        if (!Array.isArray(parent.children)) parent.children = [];
-        return parent.children;
-      };
-      const rename = (path, name) => edit(g => { const n = nodeAt(g.groups, path); if (n) n.name = name; });
-      const remove = (path) => edit(g => { const sib = siblingsAt(g.groups, path); if (sib) sib.splice(path[path.length - 1], 1); });
-      const addChild = (path) => edit(g => {
-        const n = nodeAt(g.groups, path);
+      (children || []).forEach(c => {
+        if (c == null || c === false) return;
+        n.appendChild(typeof c === 'string' ? document.createTextNode(c) : c);
+      });
+      return n;
+    }
+    function ftplRoot() { try { return document.getElementById('ftpl-root'); } catch (_) { return null; } }
+    function ftplNodeAt(groups, path) {
+      let node = null;
+      for (let k = 1; k < path.length; k += 2) {
+        const arr = k === 1 ? groups : (node ? (Array.isArray(node.children) ? node.children : (node.children = [])) : null);
+        if (!arr || !arr[path[k]]) return null;
+        node = arr[path[k]];
+      }
+      return node;
+    }
+    function ftplSiblingsAt(groups, path) {
+      if (path.length === 2) return groups;
+      const parent = ftplNodeAt(groups, path.slice(0, -2));
+      if (!parent) return null;
+      if (!Array.isArray(parent.children)) parent.children = [];
+      return parent.children;
+    }
+    function ftplDirty() { return JSON.stringify(FTPL.tpl) !== JSON.stringify(FTPL.saved); }
+    function ftplNotify() {
+      const cb = FTPL.ctx && FTPL.ctx.onDirtyChange;
+      if (typeof cb === 'function') { try { cb(ftplDirty()); } catch (_) {} }
+    }
+    function ftplHintText() {
+      return '新建/绑定项目时按这棵树生成项目文件夹骨架。'
+        + (ftplDirty() ? '有未保存的修改。' : FTPL.isDefault ? '当前为内置默认。' : '已保存自定义模板。')
+        + ' 各被评估单位的 00财务资料 / 02基础类 / 03资产基础法 / 04收益法 / 05市场法 子目录按公司与评估方法自动补齐，不在这棵树里。';
+    }
+    function ftplCountText(t) {
+      return '目录总数：' + countDirs(t === undefined ? FTPL.tpl : t) + '（上限 400，层级上限 5）。改模板只影响之后新建的项目文件夹；已经建好的项目目录不会被改动或删除。';
+    }
+    // 只刷新文字/按钮状态，不重建整棵树——输入框里打字时不能丢焦点。
+    function ftplHint() {
+      const root = ftplRoot();
+      if (!root) return;
+      const hint = root.querySelector('#ftpl-hint'); if (hint) hint.textContent = ftplHintText();
+      const cnt = root.querySelector('#ftpl-count'); if (cnt) cnt.textContent = ftplCountText();
+      const sv = root.querySelector('#ftpl-save');
+      if (sv) { sv.disabled = FTPL.busy || !FTPL.tpl || !ftplDirty(); sv.textContent = FTPL.busy ? '保存中…' : '保存模板'; }
+      const rs = root.querySelector('#ftpl-reset'); if (rs) rs.disabled = FTPL.busy;
+      const at = root.querySelector('#ftpl-addtop'); if (at) at.disabled = !FTPL.tpl || FTPL.busy;
+    }
+    function ftplEdit(fn, focusPath) {
+      if (!FTPL.tpl) return;
+      try { fn(FTPL.tpl); } catch (e) { if (FTPL.ctx && FTPL.ctx.toast) FTPL.ctx.toast('操作失败：' + String((e && e.message) || e), 'danger'); return; }
+      FTPL.focusPath = focusPath || null;
+      ftplPaint();
+      ftplNotify();
+    }
+    function ftplAddChild(path) {
+      const key = path.join('.');
+      ftplEdit(g => {
+        const n = ftplNodeAt(g.groups, path);
         if (!n) return;
         if (!Array.isArray(n.children)) n.children = [];
         n.children.push({ name: '新目录', children: [] });
+        FTPL.focusPath = path.concat(['children', n.children.length - 1]).join('.');
       });
-      const addTop = () => edit(g => { g.groups.push({ name: '新目录', children: [] }); });
-      const save = async () => {
-        patchUi({ busy: true });
-        try {
-          const r = await fetch(PREFIX + '/project/folders/template', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ template: tpl }) });
-          const d = await r.json().catch(() => ({}));
-          if (!r.ok || d.error) throw new Error(String(d.error || ('HTTP ' + r.status)));
-          setTpl(d.template); setSaved(d.template); patchUi({ isDefault: false, busy: false });
-          if (onDirtyChange) onDirtyChange(false);
-          toast('文件夹模板已保存（' + countDirs(d.template) + ' 个目录）', 'ok');
-        } catch (e) { patchUi({ busy: false }); toast('保存失败：' + String((e && e.message) || e), 'danger'); }
+      FTPL.confirmDel = ''; if (FTPL.dropTimer) { clearTimeout(FTPL.dropTimer); FTPL.dropTimer = null; }
+      if (FTPL.focusPath) {
+        const root = ftplRoot();
+        const inp = root && root.querySelector('input[data-path="' + String(FTPL.focusPath).replace(/"/g, '\\"') + '"]');
+        if (inp) { try { inp.focus(); inp.select(); } catch (_) {} }
+        FTPL.focusPath = null;
+      }
+      void key;
+    }
+    function ftplAddTop() {
+      ftplEdit(g => { g.groups.push({ name: '新目录', children: [] }); });
+    }
+    function ftplRemove(path) {
+      ftplEdit(g => { const sib = ftplSiblingsAt(g.groups, path); if (sib) sib.splice(path[path.length - 1], 1); });
+    }
+    async function ftplLoad() {
+      if (FTPL.loading) return;
+      FTPL.loading = true; FTPL.busy = true; FTPL.loadError = null;
+      ftplPaint();
+      try {
+        const r = await fetch(PREFIX + '/project/folders/template');
+        const d = await r.json().catch(() => ({}));
+        if (!r.ok || d.error) throw new Error(String(d.error || ('HTTP ' + r.status)));
+        // 深拷贝成两份独立对象：编辑直接改 FTPL.tpl，saved 必须留在读取时的快照，
+        // 否则两者共享引用 → ftplDirty() 永远 false → 「保存模板」按钮永远禁用。
+        FTPL.tpl = JSON.parse(JSON.stringify(d.template)); FTPL.saved = JSON.parse(JSON.stringify(d.template));
+        FTPL.isDefault = !!d.isDefault;
+      } catch (e) {
+        // 读不到不再卡死：用内置骨架兜底，页面保持可编辑（保存/恢复默认走服务器，成功即纠正）。
+        FTPL.loadError = String((e && e.message) || e);
+        FTPL.tpl = { version: 1, groups: NEW_FOLDER_PREVIEW.map(g => ({ name: g.name, children: g.children.map(c => ({ name: c, children: [] })) })) };
+        FTPL.saved = null; FTPL.isDefault = true;
+      }
+      FTPL.loading = false; FTPL.busy = false; FTPL.loaded = true;
+      ftplPaint(); ftplNotify();
+    }
+    async function ftplSave() {
+      const toast = (FTPL.ctx && FTPL.ctx.toast) || function () {};
+      if (!FTPL.tpl || FTPL.busy) return;
+      FTPL.busy = true; ftplPaint();
+      try {
+        const r = await fetch(PREFIX + '/project/folders/template', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ template: FTPL.tpl }) });
+        const d = await r.json().catch(() => ({}));
+        if (!r.ok || d.error) throw new Error(String(d.error || ('HTTP ' + r.status)));
+        FTPL.tpl = JSON.parse(JSON.stringify(d.template)); FTPL.saved = JSON.parse(JSON.stringify(d.template));
+        FTPL.isDefault = false; FTPL.busy = false;
+        ftplPaint(); ftplNotify();
+        toast('文件夹模板已保存（' + countDirs(d.template) + ' 个目录）', 'ok');
+      } catch (e) {
+        FTPL.busy = false; ftplPaint();
+        toast('保存失败：' + String((e && e.message) || e), 'danger');
+      }
+    }
+    async function ftplReset() {
+      const toast = (FTPL.ctx && FTPL.ctx.toast) || function () {};
+      if (FTPL.busy) return;
+      FTPL.busy = true; ftplPaint();
+      try {
+        const r = await fetch(PREFIX + '/project/folders/template', { method: 'DELETE' });
+        const d = await r.json().catch(() => ({}));
+        if (!r.ok || d.error) throw new Error(String(d.error || ('HTTP ' + r.status)));
+        FTPL.tpl = JSON.parse(JSON.stringify(d.template)); FTPL.saved = JSON.parse(JSON.stringify(d.template));
+        FTPL.isDefault = true; FTPL.busy = false; FTPL.confirmDel = '';
+        ftplPaint(); ftplNotify();
+        toast('已恢复内置默认模板', 'ok');
+      } catch (e) {
+        FTPL.busy = false; ftplPaint();
+        toast('恢复默认失败：' + String((e && e.message) || e), 'danger');
+      }
+    }
+    function ftplPaint() {
+      const root = ftplRoot();
+      if (!root) return;
+      const tpl = FTPL.tpl;
+      const busy = FTPL.busy;
+      while (root.firstChild) root.removeChild(root.firstChild);
+      const nodeBox = (node, path, depth) => {
+        const key = path.join('.');
+        const box = ftplEl('div', { style: { marginLeft: depth ? '18px' : '0' } });
+        const row = ftplEl('div', { style: { display: 'flex', alignItems: 'center', gap: '6px', padding: '3px 0' } });
+        row.appendChild(ftplEl('span', {
+          text: depth === 0 ? '📁' : '└',
+          style: { fontSize: (depth === 0 ? 13 : 12) + 'px', fontWeight: depth === 0 ? '600' : '400', minWidth: '18px' },
+        }));
+        const input = ftplEl('input', {
+          class: 'pf-in', value: node.name == null ? '' : String(node.name),
+          'data-path': key,
+          style: { width: Math.max(160, (String(node.name || '')).length * 14 + 40) + 'px' },
+        });
+        // 打字只改数据 + 文字提示，不重建 DOM（否则光标丢失）；失焦/回车时才通知父级「有未保存改动」。
+        input.addEventListener('input', () => { node.name = input.value; ftplHint(); });
+        input.addEventListener('change', () => ftplNotify());
+        row.appendChild(input);
+        const addBtn = ftplEl('button', {
+          type: 'button', class: 'pf-btn sm', title: '在这下面加一层子目录', text: '+ 子目录',
+        });
+        addBtn.disabled = depth >= 4 || busy;
+        addBtn.addEventListener('click', ev => { if (ev && ev.preventDefault) ev.preventDefault(); ftplAddChild(path); });
+        row.appendChild(addBtn);
+        const delBtn = ftplEl('button', {
+          type: 'button', class: 'pf-btn sm',
+          title: '删除这个目录（不影响已建好的目录）',
+          text: FTPL.confirmDel === key ? '确认删除？' : '删除',
+        });
+        if (FTPL.confirmDel === key) { delBtn.style.color = '#c0392b'; delBtn.style.fontWeight = '600'; }
+        delBtn.addEventListener('click', ev => {
+          if (ev && ev.preventDefault) ev.preventDefault();
+          // 不用 confirm()（部分宿主 webview 会禁弹窗，点了像没反应）：两段式，3 秒不点自动复位。
+          if (FTPL.confirmDel !== key) {
+            FTPL.confirmDel = key;
+            ftplPaint();
+            if (FTPL.dropTimer) clearTimeout(FTPL.dropTimer);
+            FTPL.dropTimer = setTimeout(() => { FTPL.dropTimer = null; FTPL.confirmDel = ''; ftplPaint(); }, 3000);
+            return;
+          }
+          FTPL.confirmDel = '';
+          if (FTPL.dropTimer) { clearTimeout(FTPL.dropTimer); FTPL.dropTimer = null; }
+          ftplRemove(path);
+        });
+        row.appendChild(delBtn);
+        box.appendChild(row);
+        (node.children || []).forEach((c, i) => box.appendChild(nodeBox(c, path.concat(['children', i]), depth + 1)));
+        return box;
       };
-      const reset = async () => {
-        // 不用 confirm()（webview 可能禁弹窗）；恢复默认本身可再点「保存模板」找回，直接执行。
-        patchUi({ busy: true });
-        try {
-          const r = await fetch(PREFIX + '/project/folders/template', { method: 'DELETE' });
-          const d = await r.json().catch(() => ({}));
-          if (!r.ok || d.error) throw new Error(String(d.error || ('HTTP ' + r.status)));
-          setTpl(d.template); setSaved(d.template); patchUi({ isDefault: true, busy: false, confirmDel: '' });
-          if (onDirtyChange) onDirtyChange(false);
-          toast('已恢复内置默认模板', 'ok');
-        } catch (e) { patchUi({ busy: false }); toast('恢复默认失败：' + String((e && e.message) || e), 'danger'); }
-      };
-      const renderNode = (node, path, depth) => h('div', { key: path.join('.'), style: { marginLeft: depth ? 18 : 0 } },
-        h('div', { style: { display: 'flex', alignItems: 'center', gap: 6, padding: '3px 0' } },
-          h('span', { style: { fontSize: depth === 0 ? 13 : 12, fontWeight: depth === 0 ? 600 : 400, minWidth: 18 } }, depth === 0 ? '📁' : '└'),
-          h('input', {
-            className: 'pf-in', value: node.name == null ? '' : String(node.name), style: { width: Math.max(160, (node.name || '').length * 14 + 40) },
-            onChange: e => rename(path, e.target.value),
-          }),
-          h('button', { type: 'button', className: 'pf-btn sm', title: '在这下面加一层子目录', onClick: () => addChild(path), disabled: depth >= 4 }, '+ 子目录'),
-          h('button', {
-            type: 'button', className: 'pf-btn sm',
-            style: confirmDel === path.join('.') ? { color: '#c0392b', fontWeight: 600 } : null,
-            title: '删除这个目录（不影响已建好的目录）',
-            onClick: () => {
-              // 不用 confirm()（部分宿主 webview 会禁掉弹窗，点了像没反应）；两段式：第一次点变红色「确认删除？」，再点才删，3 秒不点自动复位。
-              const k = path.join('.');
-              if (confirmDel !== k) { patchUi({ confirmDel: k }); setTimeout(() => { try { patchUi({ confirmDel: '' }); } catch (_) {} }, 3000); return; }
-              patchUi({ confirmDel: '' });
-              remove(path);
-            },
-          }, confirmDel === path.join('.') ? '确认删除？' : '删除'),
-        ),
-        (node.children || []).map((c, i) => renderNode(c, path.concat(['children', i]), depth + 1)));
-      const groups = tpl ? tpl.groups : [];
-      return h('div', null,
-        h('div', { className: 'wb-row', style: { justifyContent: 'space-between', marginBottom: 12 } },
-          h('div', null,
-            h('h2', { style: { margin: 0, fontSize: 18 } }, '文件夹模板'),
-            h('div', { className: 'wb-hint', style: { marginTop: 2, fontSize: 11, opacity: 0.55 } }, 'client ' + REV),
-            h('div', { className: 'wb-hint', style: { marginTop: 4 } },
-              '新建/绑定项目时按这棵树生成项目文件夹骨架。' + (dirty() ? '有未保存的修改。' : isDefault ? '当前为内置默认。' : '已保存自定义模板。')
-              + ' 各被评估单位的 00财务资料 / 02基础类 / 03资产基础法 / 04收益法 / 05市场法 子目录按公司与评估方法自动补齐，不在这棵树里。')),
-          h('div', { className: 'wb-row', style: { gap: 8 } },
-            loadError ? h('span', { className: 'pf-err' }, '读取模板失败（' + loadError + '），当前为内置骨架，可直接编辑；点「重新读取」或「恢复默认」重试。') : null,
-            loadError ? h('button', { type: 'button', className: 'pf-btn', onClick: load, disabled: busy }, '重新读取') : null,
-            h('button', { type: 'button', className: 'pf-btn', onClick: addTop, disabled: !tpl }, '+ 一级目录'),
-            h('button', { type: 'button', className: 'pf-btn', onClick: reset, disabled: busy }, '恢复默认'),
-            h('button', { type: 'button', className: 'pf-btn pri', onClick: save, disabled: busy || !tpl || !dirty() }, busy ? '保存中…' : '保存模板'))),
-        !tpl ? h('div', { className: 'wb-hint' }, busy ? '读取中…' : '模板加载失败，点「恢复默认」重建。')
-          : h('div', { style: { border: '1px solid var(--dsw-alias-border-l1,#ddd)', borderRadius: 10, padding: '10px 12px', maxHeight: '62vh', overflow: 'auto' } },
-            tpl.groups.length ? tpl.groups.map((g, i) => renderNode(g, ['groups', i], 0))
-              : h('div', { className: 'wb-hint' }, '模板是空的 —— 至少加一个一级目录再保存。')),
-        h('div', { className: 'wb-hint', style: { marginTop: 8 } },
-          '目录总数：' + countDirs(tpl) + '（上限 400，层级上限 5）。改模板只影响之后新建的项目文件夹；已经建好的项目目录不会被改动或删除。'));
+
+      // 页头
+      const headLeft = ftplEl('div', null, [
+        ftplEl('h2', { text: '文件夹模板', style: { margin: '0', fontSize: '18px' } }),
+        ftplEl('div', { class: 'wb-hint', text: 'client ' + FTPL.rev, style: { marginTop: '2px', fontSize: '11px', opacity: '0.55' } }),
+        ftplEl('div', { class: 'wb-hint', id: 'ftpl-hint', text: ftplHintText(), style: { marginTop: '4px' } }),
+      ]);
+      const headRight = ftplEl('div', { class: 'wb-row', style: { gap: '8px', alignItems: 'center' } });
+      if (FTPL.loadError) {
+        headRight.appendChild(ftplEl('span', { class: 'pf-err', text: '读取模板失败（' + FTPL.loadError + '），当前为内置骨架，可直接编辑；点「重新读取」或「恢复默认」重试。' }));
+        headRight.appendChild(ftplEl('button', { type: 'button', class: 'pf-btn', text: '重新读取', disabled: busy, onClick: () => ftplLoad() }));
+      }
+      headRight.appendChild(ftplEl('button', { type: 'button', class: 'pf-btn', id: 'ftpl-addtop', text: '+ 一级目录', disabled: !tpl || busy, onClick: () => ftplAddTop() }));
+      headRight.appendChild(ftplEl('button', { type: 'button', class: 'pf-btn', id: 'ftpl-reset', text: '恢复默认', disabled: busy, onClick: () => ftplReset() }));
+      headRight.appendChild(ftplEl('button', {
+        type: 'button', class: 'pf-btn pri', id: 'ftpl-save',
+        text: busy ? '保存中…' : '保存模板', disabled: busy || !tpl || !ftplDirty(),
+        onClick: () => ftplSave(),
+      }));
+      root.appendChild(ftplEl('div', null, [
+        ftplEl('div', { class: 'wb-row', style: { justifyContent: 'space-between', marginBottom: '12px', alignItems: 'flex-start' } }, [headLeft, headRight]),
+      ]));
+
+      // 树
+      if (!tpl) {
+        root.appendChild(ftplEl('div', { class: 'wb-hint', text: busy ? '读取中…' : '模板还没读到，点「恢复默认」重建。' }));
+      } else {
+        const tree = ftplEl('div', {
+          style: {
+            border: '1px solid var(--dsw-alias-border-l1,#ddd)', borderRadius: '10px',
+            padding: '10px 12px', maxHeight: '62vh', overflow: 'auto',
+          },
+        });
+        if (tpl.groups && tpl.groups.length) tpl.groups.forEach((g, i) => tree.appendChild(nodeBox(g, ['groups', i], 0)));
+        else tree.appendChild(ftplEl('div', { class: 'wb-hint', text: '模板是空的 —— 至少加一个一级目录再保存。' }));
+        root.appendChild(tree);
+      }
+      root.appendChild(ftplEl('div', { class: 'wb-hint', id: 'ftpl-count', text: ftplCountText(), style: { marginTop: '8px' } }));
+    }
+    function ftplMount(props) {
+      if (props) FTPL.ctx = props;
+      const root = ftplRoot();
+      if (!root) return;
+      // React 若在重渲染时清掉了我们的外来子节点（vdom 里这个 div 没有 children），这里补挂；
+      // 没被清就保持原样——正在打字的输入框才不会丢焦点。
+      if (!root.childNodes.length) ftplPaint(); else ftplHint();
+      if (!FTPL.loaded && !FTPL.loading) ftplLoad();
+    }
+    function FolderTemplatePage(props) {
+      // 不依赖 useEffect（宿主 shim 对依赖数组的 effect 不保证执行）：每次渲染后补挂一次。
+      FTPL.ctx = props || null;
+      if (!FTPL.mountScheduled) {
+        FTPL.mountScheduled = true;
+        setTimeout(() => {
+          FTPL.mountScheduled = false;
+          try { ftplMount(FTPL.ctx); } catch (e) {
+            const root = ftplRoot();
+            if (root) { while (root.firstChild) root.removeChild(root.firstChild); root.appendChild(ftplEl('div', { class: 'pf-err', text: '页面渲染失败：' + String((e && e.message) || e) })); }
+          }
+        }, 0);
+      }
+      return h('div', { id: 'ftpl-root', style: { minHeight: 120 } });
     }
     function countDirs(t) {
       if (!t || !Array.isArray(t.groups)) return 0;
@@ -11271,12 +11487,8 @@ window.__ModuleLoader__.load({
       const [toastMsg, setToastMsg] = useState(null);
       const [reportDirty, setReportDirty] = useState(false);
       const [foldersDirty, setFoldersDirty] = useState(false);
-      // 文件夹模板页的状态提升：宿主 React shim 对【子组件】setState 的重渲染不可靠
-      // （点「+ 子目录」只闪一下不更新的实锤），而顶层 setState（页签/toast）一直正常。
-      // 树 tpl / 已保存快照 saved / UI 杂项全部放顶层，FolderTemplatePage 变纯受控组件。
-      const [foldersTpl, setFoldersTpl] = useState(null);
-      const [foldersSaved, setFoldersSaved] = useState(null);
-      const [foldersUi, setFoldersUi] = useState({ isDefault: true, loadError: null, busy: false, confirmDel: '' });
+      // 文件夹模板页已改为纯 DOM 实现（见 FolderTemplatePage 上方注释）：树数据与 UI 状态都在
+      // 模块级 FTPL 里，这里只留「有未保存改动」这一个布尔给 go() 做离页拦截。
       const [compareDirty, setCompareDirty] = useState(false);
       const [sub, setSub] = useState({ work: 'projects', study: 'plans', stock: '' });
       // 浮动对话窗的开关。放在 WorkbenchPage 里而不是模块级，是为了跟随页签切换保留、
@@ -11432,7 +11644,7 @@ window.__ModuleLoader__.load({
           tab === 'report-compare' ? h(ReportComparePage, { s, toast, onDirtyChange: setCompareDirty }) :
           tab === 'data-tools' ? h(DataTools, { toast }) :
           tab === 'land-market' ? h(LandMarketPanel) :
-          tab === 'folder-template' ? h(FolderTemplatePage, { toast, onDirtyChange: setFoldersDirty, tpl: foldersTpl, setTpl: setFoldersTpl, saved: foldersSaved, setSaved: setFoldersSaved, ui: foldersUi, setUi: setFoldersUi }) :
+          tab === 'folder-template' ? h(FolderTemplatePage, { toast, onDirtyChange: setFoldersDirty }) :
           tab === 'study' ? h(Study, { s, sub: sub.study, toast, go }) :
           tab === 'stock' ? h(Stock, { s, toast, refresh }) :
           tab === 'alerts' ? h(Alerts, { s }) : h(Settings, { s, toast }),
