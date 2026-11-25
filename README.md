@@ -45,6 +45,8 @@ node --check index.js && node --check client.js
 | `export-workflow.js` | 手动整理工作流：独立批次、不覆盖源文件、逐文件结果 |
 | `tysync.js` | 天源网页表单同步引擎（ego 浏览器驱动，含回读校验） |
 | `store.js` / `library.js` / `archive.js` | 数据落盘 / 归档库 / 知识库根 |
+| `vehicle_cert.py` | 车辆权证识别归档：行驶证/登记证/里程表 → markdown → 按车牌归档 → 权证信息表（含 `stage` 整理待上传副本） |
+| `vehicle-upload.js` | 权证索引上传：opencli 驱动 Chrome → 附件上传 → 分类保存 → 回写单元格 |
 | `*.py` | 知识库扫描、文档解析、股权/财务导入 |
 
 ### 协作约定
@@ -55,19 +57,111 @@ node --check index.js && node --check client.js
 - 大改动先开 Issue 讨论；PR 请附验证方式与未验证边界。
 - **浏览器操作规则**：开发、测试与模块验收中的浏览器操作，优先使用 opencli（DSH 浏览器代理）执行——站点适配器 `site` → 通用 `opencli_*` → 动手前 `site_knowledge`；细节见 `AGENTS.md`。
 
-### 提交 Pull Request（协作者/外部贡献者）
+## 车辆评估模块（行驶证 / 登记证 / 里程）
 
-1. **从 main 拉新分支**（不要直接在 main 上改）：
-   ```bash
-   git checkout main && git pull origin main
-   git checkout -b fix/改动简述
-   ```
-2. 修改 → `node --check index.js && node --check client.js` → 涉及导出/整理的改动在临时目录 + 模拟数据下自测。
-3. **提交前自查 diff 不含**：token/cookie/授权链接（如 `zhmcp_...`）、真实项目名与人名、本机绝对路径、凭据文件内容。
-4. push 分支后在 GitHub 点 **Compare & pull request**，正文写清四项：改了什么 / 为什么 / 怎么验证的 / 已知未验证边界。
-5. 没有写权限的外部贡献者走标准 fork 流程（Fork → 在自己副本开发 → 向本仓库提 PR）；内部协作者由所有者加为 Collaborator 后可直接 push 分支。
+工作台「工作 → 车辆评估」页签，把企业给的车辆资料整理成可入底稿的权证档案。
 
-完整协作指南见仓库根目录的 `COLLABORATING.md`（含无权限 fallback、合并后同步、Issue 规范）。
+**输入**：项目根目录（含 ```02现场资料/企业提供资料/03资产基础法/<NN公司>/```）。脚本优先只看名字带「车辆 / 行驶证 / 驾驶证 / 登记证 / 权证 / 里程」的目录；一个都没有才回退扫整个公司目录。支持 pdf / doc / docx / jpg / png / xlsx，文件名不规范也能处理（车牌从文件名和正文里分别找，全角字符先做 NFKC 归一）。
+
+**项目根目录可以给哪一级**：给具体项目文件夹（例如 `D:\评估项目\<项目编号> <项目名>`）最直接；也可以给上层的项目集合目录（例如 `D:\评估项目`），这时后端先回项目列表，界面出现「项目」下拉，选完具体项目再读公司。路径里没有 `02现场资料/企业提供资料/03资产基础法` 时，界面会在按钮上方用红字提示，而不是静默无反应。选过的根目录记在浏览器 localStorage（`wb.vehicle.root`），下次打开自动恢复。
+
+**过程**：识别引擎转 markdown（图片和 pdf 带 OCR；docx 先取正文，没有正文就把内嵌图片逐张 OCR；`.doc` 先用 Word COM 转 docx）。引擎默认 `auto`：配了百度智能云 AK/SK 走百度「行驶证识别」（结构化字段，见下节），否则走 `mineru flash-extract`；→ 标签分段 + 形状正则识别字段（号牌号码 / 车辆类型 / 所有人 / 使用性质 / 品牌型号 / 车辆识别代号 / 注册日期 / 发证日期 / 里程）→ 跨记录纠错。
+
+纠错分四层（都可独立重跑，不必重新 OCR）：
+1. **车辆类型**：对规范词库做 difflib 就近匹配（ratio ≥ 0.72）。
+2. **所有人**：取同公司众数修 OCR 掉字（「OCR识别结果」→「<公司全称>」）。
+3. **品牌名**：同批出现 ≥2 次且是某记录品牌后缀的，收敛（「招日产」→「日产」）。
+4. **车牌规范化**：以里程表/清单 Excel 与原始文件名里的车牌为准，把 OCR 认错的牌子按 difflib ratio ≥ 0.84 拉回（「浙E68385」→「浙E68305」、「浙E938YL」→「浙E930YL」、「浙EL677」→「浙EL677Q」），同时改索引键与已归档文件名；同一车牌下重复类型会合并。
+
+`使用性质` 专门处理 OCR 掉「非」的情形（正文出现「使用性雕营运」这类形状时判为非营运）。
+
+**输出**：
+- `<公司>/固定资产/车辆/<车牌><类型><原扩展名>`，类型 ∈ 车辆行驶证 / 车辆登记证 / 里程；
+- 同目录 `_markdown/`（识别文本，可追溯）、`_md_cache/`（图片 OCR 缓存，按 sha1 复用）、`_vehicle_index.json`（索引）；
+- `车辆权证信息表.xlsx`：sheet1「车辆权证信息」按车牌聚合 14 列（含**备注**：自动列出缺哪些字段），sheet2「资料明细」逐份资料；两表都冻结首行、自动筛选、横向 fit-to-width 打印版式。
+
+**安全闸**：认不出车牌的、正文没有行驶证/号牌/车辆识别代号特征的（设备交接单、验收单、会议纪要之类）、文件名明显是合同协议的，一律不归档，只在日志里说明。`公里数.xlsx` 这类里程表另走「车牌→公里数」映射并回填到各车记录。
+
+**接口**（宿主侧，改完需重启 DSH）：`/api/workbench/vehicle/{companies,scan,run,progress,index,report}`；命令行可直接跑：
+
+```bash
+python vehicle_cert.py companies --root "D:\评估项目\<项目编号> <项目名>"
+python vehicle_cert.py scan --root <项目根> --company <公司文件夹名>
+python vehicle_cert.py run  --root <项目根> --company <公司文件夹名> [--source <资料子目录>] [--limit N] [--engine auto|baidu|mineru]
+python vehicle_cert.py fix    --root <项目根> --company <公司文件夹名>   # 按已存 md 重刷字段 + 车牌规范化 + 合并
+python vehicle_cert.py report --root <项目根> --company <公司文件夹名>
+python vehicle_cert.py ocr                                       # 看当前引擎与密钥（掩码）
+python vehicle_cert.py ocr --engine baidu --ak <AK> --sk <SK>    # 保存密钥
+python vehicle_cert.py ocr --check                               # 取一次 access_token 自检
+python vehicle_cert.py ocr --test <图片路径 或 b64:<base64后的路径>>  # 单图试识别
+```
+
+### 上传权证到天源底稿（权证索引）
+
+把归档好的行驶证 / 登记证按车牌写进天源「资产基础法底稿 → 车辆」的**权证索引**列。天源没有开放上传接口，模块驱动本机 Chrome（`opencli`，session `dsh-vehicle`）真实操作页面：自动导航到该科目页 → 等页面自己拿到编辑锁 → 逐份上传 → 一次性保存。
+
+**准备**：`python vehicle_cert.py stage --root <项目根> --company <公司目录名>` 先把证件整理成待上传副本（统一命名 `<车牌><类型>`，`.doc` 用 Word COM 转 PDF，因为接口只受理 pdf/docx/xlsx/jpg/png），落在 `<公司>/固定资产/车辆/_upload/`（临时目录，可重跑、可删）。
+
+**操作**：「车辆评估」页签 ③ 卡片里填两个 ID（底稿网址 `/ty/operation/<项目ID>/<单位ID>/...` 中的两段数字，填过会记住）→「读取底稿现状」核对每行已挂什么 →「试运行（只比对）」→「上传权证到天源」。默认**跳过已有同分类附件**，勾「覆盖已挂的同名分类」才会替换。
+
+**接口**：`POST /api/workbench/vehicle/upload`（body `{root,company,projectId,companyId,dryRun,overwrite}`，回 `jobId`）、`GET /api/workbench/vehicle/upload/progress?jobId=`、`GET /api/workbench/vehicle/upload/state?projectId=&companyId=`（只读，列每行车牌与已挂附件）。
+
+**链路**（实测）：`POST /ty/api/attach/upload`（multipart 字段名 `file`）→ `POST /ty/api/assignment_draft/cell_file/classify_upload`（`draftFieldCode:'QZSY'`、`draftRowId:<行_id>`、`fileUploadList:[{fileTypeDesc:'车辆行驶证',linkedFlag:0,attachId}]`，已有附件追加时带 `batchId` 与保留条目）→ `POST /ty/api/assignment_draft/save` 回写单元格。
+
+**已知约束**：
+- 编辑锁无法用接口直接申请（`edit_lock/acquire/batch` 参数对不上，返回「请求参数有误」），只能让页面停在 `?subjectCode=<车辆科目>` 由前端自己申请；拿不到 `editFlag=1` 就报 `LOCK_TIMEOUT`。
+- 车辆科目 code 因项目而异（因项目而异），模块从页面科目树里按名称「车辆」自动解析。
+- 页面注入脚本必须用 `TextDecoder` 解 base64，`atob` 直出是 Latin-1，中文车牌会变 mojibake 导致一行都匹配不上。
+- `opencli` 必须 `spawn(process.execPath, [entry, 'browser', '--session', ...])`，经 shell 会把 `--session` 吃掉。
+
+### 识别引擎：百度智能云 OCR（可选，比 mineru 准）
+
+百度「行驶证识别」直接给结构化字段（号牌号码 / 车辆类型 / 所有人 / 住址 / 使用性质 / 品牌型号 / 车辆识别代号 / 发动机号码 / 注册日期 / 发证日期 / 发证单位；副页另给核定载人数 / 总质量 / 整备质量 / 外廓尺寸 / 燃油类型 / 证芯编号），认不出的再走「通用文字识别（高精度）」兜底，所以登记证、复印件也能读。文档：<https://cloud.baidu.com/doc/OCR/s/yk3h7y3ks>。
+
+**配置**：「车辆评估」页签 ② 卡片选引擎、填百度 API Key / Secret Key 与 MinerU 精准解析 token，点「保存设置」（想顺带验证就点「测试密钥」）。都存本机 `~/.dsh/workbench-vehicle-ocr.json`（Windows：`C:\Users\<你>\.dsh\workbench-vehicle-ocr.json`，结构 `{engine, baidu:{ak,sk}, mineru:{token,model}, limits:{}}`），页面只显示掩码；也可用环境变量 `DSH_BAIDU_OCR_AK` / `DSH_BAIDU_OCR_SK` / `DSH_MINERU_TOKEN` / `DSH_MINERU_MODEL` / `DSH_VEHICLE_OCR_ENGINE` 覆盖。
+
+**引擎优先级**：`auto` = 有百度 AK+SK 用 `baidu`；没有百度但有 MinerU token 用 `mineru-pro`；都没有用 `mineru`（轻量）。显式指定 `baidu` / `mineru-pro` 时失败直接报错不回退（避免静默降级），`auto` 下才回退。access_token 缓存在 `~/.dsh/baidu-ocr-token.json`（30 天，遇 110/111 自动刷新）。
+
+**接口**：`GET /api/workbench/vehicle/ocr`（读配置+用量，回 `{engine,resolved,akMasked,hasKey,mineruTokenMasked,hasMineruToken,mineruModel,usage,usageLine}`）、`POST /api/workbench/vehicle/ocr`（body `{engine,ak,sk,mineruToken,mineruModel,baiduLimit,mineruLimit,resetUsage,check,test,testEngine}`，保存并可选自检/试识别）、`GET|POST /api/workbench/vehicle/usage`（读用量 / `{reset:true}` 清零）。`POST /api/workbench/vehicle/run` 接受 `engine`（`auto|baidu|mineru|mineru-pro`）。
+
+**已踩的坑**：
+- 行驶证正页当副页传、或根本不是行驶证 → 百度回 `{"error_code":282103,"error_msg":"recognize error, failed to match the template"}`，模块据此转通用高精度 OCR，不当失败。
+- 百度返回的日期是 `20221117` 紧凑格式，写 md 前统一归一成 `2022-11-17`（否则报表里两种格式混排）。
+- 走百度引擎时**结构化字段优先于正则解析**：每条资料建 `direct`，识别完 `fields.update(direct)`，OCR 掉字也压不歪字段。
+- `run` 对同 `车牌|类型` 已存在且旧 md 更长的直接判 `dup`，所以换引擎只影响**新资料**；要重刷已有记录用 `fix`（按已存 md 重解析，不重新调接口）。
+
+### MinerU 两种模式：轻量（flash）与精准解析（extract）
+
+官方文档 <https://mineru.net/apiManage/docs>。两条路子都在本模块里可选：
+
+| | MinerU 轻量（Agent 轻量解析） | MinerU 精准解析 |
+|---|---|---|
+| 命令 | `mineru flash-extract <file> --ocr --language ch` | `mineru --token <T> extract <file> --model vlm --language ch --ocr -o <dir>` |
+| 鉴权 | 免 token（IP 限频） | 需 API 管理页创建的 token（`sk-…`） |
+| 限制 | ≤10MB、≤20 页 | ≤200MB、≤200 页（本机 CLI 帮助写 600 页） |
+| 输出 | 仅 markdown | Zip/目录：markdown + images，可导 docx/html/latex |
+| 额度 | 按份（本模块按 5000 份/天记） | 每天 1000 页最高优先级，超出降优先级 |
+| 适用 | 普通行驶证、正文可直接抽字段的文件 | 登记证书、表格/公式复杂、扫描质量差的版面 |
+
+实测：同一张行驶证，精准解析仍会掉字（`号牌号E60153` 丢「浙」、`使用性Use Character` 丢「质」、`022-11-17` 丢年份），**行驶证仍应优先百度结构化识别**；精准解析的价值在登记证这类整页表格版面。
+
+### 用量与额度（本机记账）
+
+每次真正调用识别接口都会记账，存在 `~/.dsh/workbench-vehicle-usage.json`：
+
+- **百度**：按自然月累计（`baidu_month`，默认 1000 次/月免费额度）；行驶证识别与通用高精度 OCR 都算 1 次；token 失效（110/111）不计。
+- **MinerU 轻量**：按自然日累计份数（`mineru_day`，默认 5000 份/天）。
+- **MinerU 精准**：按自然日累计份数与页数（同一份 PDF 多页按页折算，便于对照每日页额度）。
+
+跨月/跨日自动归零，`total` 字段保留历史累计。额度可在配置文件的 `limits` 里改（`{"baidu_month":1000,"mineru_day":5000}`），命令行走 `ocr --baidu-limit` / `ocr --mineru-limit`。
+
+**看用量**：「车辆评估」② 卡片底部直接显示「百度 x/1000 次 · 本月 ｜ MinerU 轻量 x/5000 份 · 今日 ｜ MinerU 精准 x 份 / x 页」，也有「刷新用量」「清零用量」两个按钮；命令行 `python vehicle_cert.py usage`，清零 `usage --reset`。
+
+注意：只统计**本机**调用，网页版或别的机器用掉的不在账内；这里显示的是本地估算，真正的配额以百度/MinerU 控制台为准。
+
+命令补充：`ocr --test <图片或 b64:路径> --test-engine mineru-pro` 可以单张试精准解析；`ocr --mineru-token sk-…` 保存 token，`--mineru-model vlm|pipeline` 选模型。
+
+依赖：`mineru-open-api`（`npm i -g mineru-open-api`）、`python-docx`、`openpyxl`、`pywin32`（只有 `.doc` 转换需要）；上传另需 `@jackwener/opencli` 与本机已登录天源的 Chrome。
 
 ## 天源系统真实对接（本轮新增）
 
@@ -764,9 +858,9 @@ node --check index.js && node --check client.js
 
 > 本节取代前面各节里「项目文件夹建在 `<数据目录>` 下」的旧描述；数据目录现在只放 `工作台数据.json` 与 `股票数据\`。
 
-### 1. 项目文件夹根目录：默认 `D:\天源评估\00项目ing`
+### 1. 项目文件夹根目录：默认 `D:\评估项目`
 
-- 本地项目的文件夹（`<项目编号> <项目简称>`）不再建在数据目录（`D:\天源评估\个人工作台`）里，统一建在**项目目录**：默认 `D:\天源评估\00项目ing`。
+- 本地项目的文件夹（`<项目编号> <项目简称>`）不再建在数据目录（`D:\天源评估\个人工作台`）里，统一建在**项目目录**：默认 `D:\评估项目`。
 - 数据目录仍只放 `工作台数据.json` 与 `股票数据\`；两套目录分开了。设置页新增「本地项目文件夹位置」，可以改项目目录、恢复默认、直接打开，旁边显示路径来源（设置 / 环境变量 / 默认值）。
 - **老项目不用搬**：所有项目目录操作都先按「项目目录 → 数据目录」两个根查找。升级前建在 `个人工作台\2026 老项目` 里的项目仍然能打开、上传、生成模板目录；只有找不到时才在 `00项目ing` 下新建，不会留下重复空目录。
 - 配置写在 `~/.dsh/workbench-store.json`：`{ dir, projectsDir }`；环境变量 `DSH_WORKBENCH_PROJECTS_DIR` 只当默认值（测试用）。
@@ -1201,7 +1295,7 @@ daemon 是按需拉起的，刚被杀/空闲退出后 `tabs` 会卡在「等扩�
 - `node --check`：`client.js` / `index.js` / `folders.js` / `dsh-workbench-host/index.js` 全部通过。
 - `tools/wb-test-folders.mjs`（改成断言式）：3 家公司 → 56 个相对目录；`00财务资料/<公司>` 一家一个、`02基础类/<公司>/<4 个分类>` 一家 5 个、`01管理类` 仍只有 1 个且不含公司名、没有 `04底稿/基础类资料`、`存货=0` 不建目录、`12固定资产/03车辆` 存在。`FOLDERS OK`。
 - `tools/wb-test-build.mjs`：真实落盘首轮 `created 63`、二轮 `created 0 / existed 63`（幂等）。
-- `tools/uiharness/run-rev43-shots.mjs`（先起 `tools/uiharness/server.mjs` 8799，Playwright 跑真实 `client.js`）：母公司行科目名称 `—`、两家子公司分别是 `长期股权投资` / `其他非流动资产-股权投资`；基础类资料 3 家公司各一块、每块 21 行、4 个分类；点第二家公司的「财务资料」落盘到 `…/02基础类/德清县杭绕高速有限公司/财务资料`、点块头落到 `…/02基础类/德清县杭绕高速有限公司`；财务资料页签切公司后按钮/目录跟着换（`00财务资料/德清县杭绕高速有限公司`）；管理类底稿仍是 0 个公司块、20 行；`pageerror` 为空。`UI CHECK OK`；截图 `REV43-1-equity.png`–`REV43-4-mgmt.png`。
+- `tools/uiharness/run-rev43-shots.mjs`（先起 `tools/uiharness/server.mjs` 8799，Playwright 跑真实 `client.js`）：母公司行科目名称 `—`、两家子公司分别是 `长期股权投资` / `其他非流动资产-股权投资`；基础类资料 3 家公司各一块、每块 21 行、4 个分类；点第二家公司的「财务资料」落盘到 `…/02基础类/<公司全称>/财务资料`、点块头落到 `…/02基础类/<公司全称>`；财务资料页签切公司后按钮/目录跟着换（`00财务资料/<公司全称>`）；管理类底稿仍是 0 个公司块、20 行；`pageerror` 为空。`UI CHECK OK`；截图 `REV43-1-equity.png`–`REV43-4-mgmt.png`。
 - 顺手补了 `tools/uiharness/server.mjs` 的 `/project/folder` 桩：以前忽略 `sub`，现在跟宿主一样按 `sub` 建子目录并回带完整 `path`，否则这条路径根本测不出来。
 
 ### rev44：财务资料 / 基础类资料 按钮挪到股权信息每行的「操作」里
@@ -1235,7 +1329,7 @@ daemon 是按需拉起的，刚被杀/空闲退出后 `tabs` 会卡在「等扩�
 
 **验证**
 - `node --check client.js` 通过。
-- `tools/uiharness/run-rev45-company-views.mjs` → `COMPANY VIEW OK`：页签只剩 `股权信息 / 管理类底稿`（`财务资料`、`基础类资料` 都没了）；点第 2 行「财务资料」→ 有 `← 返回股权信息`、标题 `1-1 德清县杭绕高速有限公司`、**没有公司下拉**、`目录：02现场资料/企业提供资料/00财务资料/德清县杭绕高速有限公司`、看到该公司的 1 条科目（应收账款）、页头 1 个「打开文件夹」；返回后仍在「股权信息」且有 2 行；点「基础类资料」→ 21 行、4 个分类、0 个 `.pw-co-block`、目录指向 `02基础类/德清县杭绕高速有限公司`；再点「管理类底稿」页签 → 单公司视图让位、20 行、无「返回」按钮；`pageerror` 为空。截图 `REV45-1-company-fin.png`、`REV45-2-company-basic.png`、`REV45-3-mgmt-tab.png`。
+- `tools/uiharness/run-rev45-company-views.mjs` → `COMPANY VIEW OK`：页签只剩 `股权信息 / 管理类底稿`（`财务资料`、`基础类资料` 都没了）；点第 2 行「财务资料」→ 有 `← 返回股权信息`、标题 `1-1 <公司全称>`、**没有公司下拉**、`目录：02现场资料/企业提供资料/00财务资料/<公司全称>`、看到该公司的 1 条科目（应收账款）、页头 1 个「打开文件夹」；返回后仍在「股权信息」且有 2 行；点「基础类资料」→ 21 行、4 个分类、0 个 `.pw-co-block`、目录指向 `02基础类/<公司全称>`；再点「管理类底稿」页签 → 单公司视图让位、20 行、无「返回」按钮；`pageerror` 为空。截图 `REV45-1-company-fin.png`、`REV45-2-company-basic.png`、`REV45-3-mgmt-tab.png`。
 - `tools/uiharness/run-rev43-shots.mjs` 精简成只验「科目名称母公司不填」→ `SUBJECT OK`；`run-rev44-narrow.mjs` 仍 `NARROW OK`（1280 宽、真实数据、4 个行内按钮不挤压表格）。rev44 里「点了直接打开文件夹」的断言随本次改动删除（`run-rev44-row-actions.mjs` 已删）。
 
 ### rev46：管理类底稿生成到 03评估底稿 下（不再单独一个 04底稿）
@@ -1244,7 +1338,7 @@ daemon 是按需拉起的，刚被杀/空闲退出后 `tabs` 会卡在「等扩�
 
 - `folders.js`：新增 `MGMT_CATEGORIES`、`MGMT_FOLDER = '03评估底稿/管理类底稿'`；`planProjectFolders` 在固定骨架之后把这个目录 + 6 个分类一并 push（所以 **「生成项目文件夹」会真的把这套建出来**，以前只在点「打开文件夹」时才懒建，而且建在 `04底稿`）。
 - `client.js`：`catalogFolder('mgmt', …)` 改成 `MGMT_FOLDER + '/' + 分类`；管理类底稿页签的提示文案跟着改；「项目文件」页签的「管理类底稿」按钮指向 `03评估底稿/管理类底稿`；「报表模板」页签原来借道 `catalogFolder('mgmt','报表模板')`，现在独立成 `03评估底稿/报表模板`（提示文案同步）。
-- 旧项目里项目根目录下那个 `04底稿/管理类底稿/…` 不再产生；本机 `20261117001 沪杭甬高速公路` 下那个**空的** `04底稿` 已经手工删掉（没有文件，删前确认过 `find -type f` 为 0）。
+- 旧项目里项目根目录下那个 `04底稿/管理类底稿/…` 不再产生；本机 `<项目编号> <项目名>` 下那个**空的** `04底稿` 已经手工删掉（没有文件，删前确认过 `find -type f` 为 0）。
 - `index.js` 的 `REV` 与 `dsh-workbench-host/index.js` 的 `?rev=` 同步到 `rev44`。**`folders.js` 在宿主侧，要重启 DSH 才生效**；`client.js` 刷新页面即可。
 
 **验证**
@@ -1302,3 +1396,41 @@ ego 的规则是：task space 被用户操作过就归用户，agent 不能自�
 - 前端 `client.js`：`AssistantDock` 浮层（拖动/放大/模型选择/持久化）、`AssistantPanel` 状态卡与说明。
 
 **生效**：`index.js` 要重启 DSH（REV 标记）；`client.js` 刷新页面。
+
+## 财务资料：报表显示期数（2026-11-23）
+
+天源「参数设置」里的 **报表显示期数**（1-6 期）现在在本地财务资料页也生效，两边的金额列口径一致。
+
+- **列怎么排**：资产负债表 / 利润表都是一年一列，**最左一期＝评估基准日所在年度的 12-31**，往右依次往前推一年，列数＝报表显示期数。例：基准日 2025-12-31、**默认 4 期（3 年 1 期）** → `2025-12-31 / 2024-12-31 / 2023-12-31 / 2022-12-31`；选到 6 期就再往前推到 2020-12-31。
+- **哪来的数**：审定报表的「资 / 利」本身只有两期（期末/期初或本期/上期），分别落在**第 1 列（基准日年度）**和**第 2 列（上一年度）**，更早的列没有数就显示 `—`。实际写入天源时仍按被导入那一年的年度 sheet 走（`reportYear`），期数列只是展示口径。
+- **改期数**：第一行「报表显示期数」下拉（1-6 期，**默认 4 期＝基准日年度 + 往前 3 年**），改完立即重排；期数存在 `finance[pid].companies[cid].periods`。
+- **基准日**：取项目「基本信息」里的评估基准日；没填时退回用报表表头里的年度，并在期数旁边提示「先填评估基准日」。
+- **数据从哪来**：`finance_statement.py` 的 statements 模式除了 `rows` 还输出 `rowsByKind`（`{now, prev}`），前端换期数时不需要重新解析文件；解析时如果带了 `--periods / --basedate`，会在返回里回显 `periodsOption / baseDateOption`。
+- **回归**：`tools/uiharness/run-finance-periods.mjs`（默认 4 期表头、导入后货币资金落 2025 列且 2024 列有期初数、改 3 期后表头变 3 列、利润表同步变 3 期）。
+
+## 面板空白自诊断（2026-11-23）
+
+真机（DSH 桌面版）里「个人工作台」偶尔整块空白，而本地无头回归（真实 client.js + 真实数据）始终正常，说明问题在桌面运行时的加载/注册环节，需要现场证据。插件内置一份轻量自诊断，**正常使用没有任何界面变化**：
+
+- **注册结果**：`apply()` 每次执行都把结果写进 `localStorage['dsh-workbench:diag']` 的 `apply` 字段：`{version, inject, slots, locale, betterSidebar, main:'ok'|'ERR …', sidebar:'ok'|'ERR …'}`。看到这条记录就能判断「插件是否被加载、主区面板是否注册成功」。
+- **渲染错误**：面板内部抛错由错误边界接住，页面显示「面板渲染出错」+ 原始堆栈（而不是一片空白），同时写进 diag 的 `renderError`。
+- **未捕获异常**：`window.onerror` / `unhandledrejection` 的首条原因写进 diag 的 `windowError` / `rejection`。
+- **DOM 标记**：同一份 JSON 挂在 `document.body[data-wb-diag]`（截断 1200 字符），方便截图。
+
+取证步骤（面板空白时）：
+
+1. 工作台窗口按 `Ctrl+Shift+I` 打开开发者工具 → Console。
+2. 输入 `localStorage['dsh-workbench:diag']` 回车，把输出发出来。
+3. 顺带看一眼 `document.body.getAttribute('data-wb-diag')`。
+
+判读：
+
+| diag 内容 | 含义 | 处置 |
+| --- | --- | --- |
+| 完全没有这个键 | client 半未被加载（boot 清单没有它 / bundle 404 / id 与包名不一致） | 查 `~/.dsh/profiles/desktop/cordis.patch.yml` 的 insert 段与 `node_modules/@local` 软链；核对 `client.js` 第 2 行 id＝`package.json` 的 name |
+| `apply.main:'ERR …'` | 槽位注册抛错 | 按错误文案定位（多为 DSH 升级后 slots API 变化） |
+| `main:'ok'` 但页面空白 | 面板已注册，问题在渲染或选中 | 看 `renderError` / `windowError` |
+| `betterSidebar:false` | 右侧栏精简页签没挂上（不影响主区面板） | 确认 `dsh-better-sidebar` 已启用 |
+
+**生效**：`client.js` 刷新页面即可；`index.js` 的 REV 现在是 `rev56`（改了宿主代码要重启 DSH）。
+

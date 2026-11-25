@@ -17,6 +17,7 @@ import * as tySession from './tianyuan-session.js';
 // 报告导出与同步填表都只走 opencli（用户真实浏览器）一条通道；
 // ego 独立窗口引擎（原 report-ego.js）已于 2026-11-23 完整移除。
 import * as rb from './report-browser.js';
+import { uploadCerts as uploadVehicleCerts, readCerts as readVehicleCerts } from './vehicle-upload.js';
 import { createCliAuth } from './cli-auth.js';
 import { runManualWorkflow } from './export-workflow.js';
 const cliAuth = createCliAuth();
@@ -785,6 +786,24 @@ async function financeScript(args) {
   throw lastErr || new Error('没有可用的 python（需要 openpyxl）');
 }
 
+// 财务报表（审定报表「资 / 利」）读取：交给 finance_statement.py --mode statements。
+// 返回 statements[]，每项带 sheetData（可原样作为天源 prepare 的 sheetList 一项）。
+async function financeStatementScript(args) {
+  const script = fileURLToPath(new URL('./finance_statement.py', import.meta.url));
+  let lastErr = null;
+  for (const py of PYTHON_CANDIDATES) {
+    try {
+      const r = await runCli(py, [script, ...args], 120000);
+      if (r.code !== 0) { lastErr = new Error((r.stderr || '').slice(0, 300) || ('python 退出码 ' + r.code)); continue; }
+      const j = parseFirstJson(r.stdout);
+      if (!j) { lastErr = new Error('财务报表脚本输出无法解析'); continue; }
+      if (!j.ok) { lastErr = new Error(j.error || '财务报表脚本报错'); continue; }
+      return j;
+    } catch (e) { lastErr = e; }
+  }
+  throw lastErr || new Error('没有可用的 python（需要 openpyxl）');
+}
+
 async function equityScript(args) {
   const script = fileURLToPath(new URL('./equity_import.py', import.meta.url));
   let lastErr = null;
@@ -1296,7 +1315,6 @@ async function writeFooterStore(next) {
 const FOOTER_SCRIPT = join(dirname(fileURLToPath(import.meta.url)), 'footer_workbook.py');
 const FILL_SCRIPT = join(dirname(fileURLToPath(import.meta.url)), 'fill_print_height.py');
 const SAFE_FILL_SCRIPT = join(dirname(fileURLToPath(import.meta.url)), 'safe_fill_rows.py');
-
 function tyExportSkillsDir() {
   return [
     process.env.TIANYUAN_PRINT_SKILLS_DIR,
@@ -1392,9 +1410,7 @@ async function runTyExport(b) {
     }
     const after = new Set(); await walkXlsx(outDir, after);
     const exported = [...after];
-
     if (!exported.length) { clearProg(); return { status: 500, body: { ok: false, outDir, error: 'tycpv 已退出但目录里没有新 xlsx：' + outDir } }; }
-    setProg({ stage: 'process', done: 0, total: exported.length, file: '', msg: '开始逐个工作簿整理…' });
 
     // 页脚配置：按请求里的公司 ID 精确匹配；CLI 若按公司分了子目录（目录名是公司 ID），
     // 目录里的工作簿直接绑定该 ID；目录名对不上任何所选公司 ID 的工作簿不写页脚（不猜文件名）。
@@ -1416,6 +1432,7 @@ async function runTyExport(b) {
         }
       } catch (err) { footerWarnings.push('页脚配置读取失败，未写入页脚：' + String(err && err.message || err)); }
     }
+    setProg({ stage: 'process', done: 0, total: exported.length, file: '', msg: '开始逐个工作簿整理…' });
 
     const results = [];
     for (const [fi, src] of exported.entries()) {
@@ -1861,6 +1878,56 @@ async function runAssistantChat(ctx, req) {
   });
 }
 
+// ---------- 车辆评估（vehicle_cert.py） ----------
+// 车辆权证识别归档：扫企业提供的行驶证/登记证/里程表 → MinerU 转 markdown → 按车牌+证件类型
+// 归档到 <公司>/固定资产/车辆/ → 生成「车辆权证信息表.xlsx」。
+// 识别规则、字段纠错、Excel 版式全在 python 脚本里（单机可复现），宿主侧只负责起进程、
+// 把脚本的逐行 JSON 事件转成进度，避免同一套规则在 JS/Python 两处漂移。
+const VEHICLE_SCRIPT = fileURLToPath(new URL('./vehicle_cert.py', import.meta.url));
+
+function pickPython() {
+  for (const py of PYTHON_CANDIDATES) {
+    if (py && /[\\/]/.test(py) && existsSync(py)) return py;
+  }
+  return process.platform === 'win32' ? 'python' : 'python3';
+}
+
+// 跑 vehicle_cert.py：按行解析 JSON 事件，边跑边回调（长时间 OCR 也能看到进度）。
+function vehicleSpawn(args, onEvent, timeoutMs) {
+  return new Promise(resolve => {
+    const env = { ...process.env, PYTHONIOENCODING: 'utf-8', PYTHONUTF8: '1' };
+    let child;
+    try { child = spawn(pickPython(), [VEHICLE_SCRIPT, ...args], { env, windowsHide: true }); }
+    catch (e) { resolve({ code: -1, stderr: String((e && e.message) || e) }); return; }
+    let buf = '', err = '';
+    const timer = timeoutMs ? setTimeout(() => { try { child.kill(); } catch (e) {} }, timeoutMs) : null;
+    const take = (line) => {
+      const s = String(line || '').trim();
+      if (!s.startsWith('{')) return;
+      try { onEvent && onEvent(JSON.parse(s)); } catch (e) {}
+    };
+    child.stdout.on('data', d => {
+      buf += d.toString('utf8');
+      let i;
+      while ((i = buf.indexOf('\n')) >= 0) { take(buf.slice(0, i)); buf = buf.slice(i + 1); }
+    });
+    child.stderr.on('data', d => { err += d.toString('utf8'); });
+    child.on('error', e => { if (timer) clearTimeout(timer); resolve({ code: -1, stderr: err + String((e && e.message) || e) }); });
+    child.on('close', code => { if (timer) clearTimeout(timer); take(buf); resolve({ code, stderr: err }); });
+  });
+}
+
+async function vehicleCall(args, timeoutMs) {
+  const events = [];
+  const r = await vehicleSpawn(args, e => events.push(e), timeoutMs || 300000);
+  return { code: r.code, stderr: r.stderr, events };
+}
+
+function vehicleErr(r) {
+  const e = r.events.find(x => x.event === 'error');
+  return (e && e.msg) || String(r.stderr || '').trim().slice(-300) || ('脚本退出码 ' + r.code);
+}
+
 export function apply(ctx) {
   // 幂等：宿主半侧有两个 entry（主包 + 仅宿主的包装包）都会 apply，
   // 用下面的「路由归属表」保证同一路径只注册一次。
@@ -1871,7 +1938,7 @@ export function apply(ctx) {
   const G = globalThis;
   // 版本号写进 ~/.dsh/workbench-host-applied.json 的 rev 字段，排障时用来确认
   // 运行中的进程到底加载了哪一版宿主代码。改了宿主逻辑就往上加一。
-  const REV = 'rev58-generic-fill-declare';
+  const REV = 'rev62-merge-pr2';   // + 车辆评估模块（识别归档 + 上传天源权证索引 + 百度 OCR / MinerU 双引擎 + 用量统计）+ PR#2 合并（财务报表解析/数据工具/币种汇率），补回 rev58 页脚后处理块
   // 路由归属表：path -> 「注册它的那个 apply() 实例」的 token。
   //
   // 为什么不用「REV 布尔标记挡住第二次 apply」：宿主半侧有两个 entry（主包 + 仅宿主的
@@ -1880,6 +1947,283 @@ export function apply(ctx) {
   // 都不剩、整个文件库 404。改成按实例认领/释放，既能去重也能正确交接。
   G.__dshWorkbenchRouteOwners = G.__dshWorkbenchRouteOwners || new Map();
   const routes = [
+    // ---------- 车辆评估模块 ----------
+    {
+      // 列出可处理的被评估公司：<项目根>/02现场资料/企业提供资料/03资产基础法/<NN公司名>/
+      path: PREFIX + '/vehicle/companies', methods: ['GET'], fetch: async (req) => {
+        try {
+          const u = new URL(req.url, 'http://127.0.0.1');
+          const root = String(u.searchParams.get('root') || '').trim();
+          if (!root) return json({ ok: false, error: '缺少 root（项目根目录）' }, 400);
+          if (!existsSync(root)) return json({ ok: false, error: '目录不存在：' + root }, 400);
+          const r = await vehicleCall(['companies', '--root', root], 60000);
+          const ev = r.events.find(x => x.event === 'companies');
+          if (!ev) return json({ ok: false, error: vehicleErr(r) }, 500);
+          return json({ ok: true, base: ev.base, companies: ev.companies || [] });
+        } catch (e) { return json({ ok: false, error: String((e && e.message) || e) }, 500); }
+      },
+    },
+    {
+      // 预扫描：看看这家公司名下会被处理哪些资料（优先只看车辆/行驶证相关目录）
+      path: PREFIX + '/vehicle/scan', methods: ['GET'], fetch: async (req) => {
+        try {
+          const u = new URL(req.url, 'http://127.0.0.1');
+          const root = String(u.searchParams.get('root') || '').trim();
+          const company = String(u.searchParams.get('company') || '').trim();
+          const source = String(u.searchParams.get('source') || '').trim();
+          if (!root || !company) return json({ ok: false, error: '缺少 root 或 company' }, 400);
+          const args = ['scan', '--root', root, '--company', company];
+          if (source) args.push('--source', source);
+          const r = await vehicleCall(args, 120000);
+          const ev = r.events.find(x => x.event === 'scan');
+          if (!ev) return json({ ok: false, error: vehicleErr(r) }, 500);
+          const c = (ev.companies || [])[0] || { files: [], count: 0 };
+          return json({ ok: true, base: ev.base, company: c.company, target: c.target, count: c.count,
+            files: (c.files || []).map(x => ({ name: x.name, plate: x.plate, ext: x.ext, size: x.size })) });
+        } catch (e) { return json({ ok: false, error: String((e && e.message) || e) }, 500); }
+      },
+    },
+    {
+      // 开始识别归档（后台跑，返回 jobId；进度用 /vehicle/progress 轮询）
+      path: PREFIX + '/vehicle/run', methods: ['POST'], fetch: async (req) => {
+        try {
+          const body = await req.json().catch(() => ({}));
+          const root = String(body.root || '').trim();
+          const company = String(body.company || '').trim();
+          const source = String(body.source || '').trim();
+          const engine = String(body.engine || '').trim();
+          if (!root || !company) return json({ ok: false, error: '缺少 root 或 company' }, 400);
+          const jobId = 'veh-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 6);
+          const jobs = G.__dshVehicleJobs || (G.__dshVehicleJobs = new Map());
+          const st = { at: Date.now(), status: 'running', message: '准备中…', n: 0, total: 0, file: '', records: [], target: '', logs: [] };
+          jobs.set(jobId, st);
+          const args = ['run', '--root', root, '--company', company];
+          if (source) args.push('--source', source);
+          if (Number(body.limit) > 0) args.push('--limit', String(Number(body.limit)));
+          if (['baidu', 'mineru', 'mineru-pro', 'auto'].includes(engine)) args.push('--engine', engine);
+          (async () => {
+            try {
+              const r = await vehicleSpawn(args, ev => {
+                const cur = jobs.get(jobId);
+                if (!cur) return;
+                if (ev.event === 'start') { cur.total = ev.total || 0; cur.target = ev.target || ''; cur.message = '共 ' + cur.total + ' 份资料待识别'; }
+                else if (ev.event === 'progress') { cur.n = ev.n || 0; cur.total = ev.total || cur.total; cur.file = ev.file || ''; cur.message = '正在识别 ' + cur.n + '/' + cur.total + '：' + (ev.file || ''); }
+                else if (ev.event === 'file') {
+                  const line = (ev.status === 'ok' ? '✓ ' : ev.status === 'dup' ? '· 已存在 ' : ev.status === 'mileage' ? '✓ 里程表 ' : ev.status === 'skip' ? '· 跳过 ' : '✗ 失败 ')
+                    + (ev.plate ? ev.plate + ' ' : '') + (ev.file || '') + (ev.msg ? '（' + ev.msg + '）' : '');
+                  cur.logs.push(line);
+                  if (cur.logs.length > 300) cur.logs.splice(0, cur.logs.length - 300);
+                  if (ev.status === 'ok' && ev.plate) cur.records.push({ plate: ev.plate, type: ev.type, fields: ev.fields, targetName: ev.target });
+                } else if (ev.event === 'log') { cur.logs.push('· ' + (ev.msg || '')); }
+                else if (ev.event === 'error') { cur.status = 'failed'; cur.message = ev.msg || '识别失败'; }
+                else if (ev.event === 'done') { cur.records = (ev.records || []).map(x => ({ plate: x.plate, type: x.type, fields: x.fields, targetName: x.targetName })); }
+              }, 3600000);
+              const cur = jobs.get(jobId) || st;
+              if (cur.status !== 'failed') {
+                cur.status = r.code === 0 ? 'done' : 'failed';
+                cur.message = r.code === 0 ? ('归档完成：' + cur.records.length + ' 条记录') : (vehicleErr(r) || ('脚本退出码 ' + r.code));
+              }
+              cur.at = Date.now();
+            } catch (e) {
+              const cur = jobs.get(jobId);
+              if (cur) { cur.status = 'failed'; cur.message = String((e && e.message) || e); }
+            }
+          })();
+          return json({ ok: true, jobId });
+        } catch (e) { return json({ ok: false, error: String((e && e.message) || e) }, 500); }
+      },
+    },
+    {
+      // 轮询识别进度；无此任务返回 unknown
+      path: PREFIX + '/vehicle/progress', methods: ['GET'], fetch: async (req) => {
+        const u = new URL(req.url, 'http://127.0.0.1');
+        const jobId = String(u.searchParams.get('jobId') || '').trim();
+        const jobs = G.__dshVehicleJobs;
+        const st = jobs && jobs.get(jobId);
+        if (!st) return json({ ok: true, job: { status: 'unknown' } });
+        return json({ ok: true, job: { status: st.status, message: st.message, n: st.n, total: st.total, file: st.file, target: st.target, records: st.records, logs: st.logs.slice(-60) } });
+      },
+    },
+    {
+      // 读取已归档索引（刷新页面后仍能看到上次结果）
+      path: PREFIX + '/vehicle/index', methods: ['GET'], fetch: async (req) => {
+        try {
+          const u = new URL(req.url, 'http://127.0.0.1');
+          const root = String(u.searchParams.get('root') || '').trim();
+          const company = String(u.searchParams.get('company') || '').trim();
+          if (!root || !company) return json({ ok: false, error: '缺少 root 或 company' }, 400);
+          const target = join(root, '02现场资料', '企业提供资料', '03资产基础法', company, '固定资产', '车辆');
+          const idxPath = join(target, '_vehicle_index.json');
+          if (!existsSync(idxPath)) return json({ ok: true, target, records: [], report: null });
+          const idx = JSON.parse(await readFile(idxPath, 'utf8'));
+          const records = Object.keys(idx).map(k => {
+            const r = idx[k] || {};
+            return { plate: r.plate, type: r.type, fields: r.fields || {}, targetName: r.targetName || '', source: String(r.source || '').split(/[\\/]/).pop() };
+          });
+          const report = join(target, '车辆权证信息表.xlsx');
+          return json({ ok: true, target, records, report: existsSync(report) ? report : null });
+        } catch (e) { return json({ ok: false, error: String((e && e.message) || e) }, 500); }
+      },
+    },
+    {
+      // 生成「车辆权证信息表.xlsx」
+      path: PREFIX + '/vehicle/report', methods: ['POST'], fetch: async (req) => {
+        try {
+          const body = await req.json().catch(() => ({}));
+          const root = String(body.root || '').trim();
+          const company = String(body.company || '').trim();
+          if (!root || !company) return json({ ok: false, error: '缺少 root 或 company' }, 400);
+          const r = await vehicleCall(['report', '--root', root, '--company', company], 180000);
+          const ev = r.events.find(x => x.event === 'report');
+          if (!ev) return json({ ok: false, error: vehicleErr(r) }, 500);
+          return json({ ok: true, path: ev.path, rows: ev.rows, details: ev.details });
+        } catch (e) { return json({ ok: false, error: String((e && e.message) || e) }, 500); }
+      },
+    },
+    {
+      // 识别引擎设置：GET 读当前配置（密钥只回掩码）+ 本月/今日用量，POST 保存 / 自检 / 试识别。
+      // body: {engine?: 'auto'|'baidu'|'mineru'|'mineru-pro', ak?, sk?, mineruToken?, mineruModel?,
+      //        baiduLimit?, mineruLimit?, resetUsage?, check?: boolean, test?: 图片路径, testEngine?}
+      path: PREFIX + '/vehicle/ocr', methods: ['GET', 'POST'], fetch: async (req) => {
+        try {
+          const args = ['ocr'];
+          if (req.method === 'POST') {
+            const body = await req.json().catch(() => ({}));
+            const engine = String(body.engine || '').trim();
+            const ak = String(body.ak || '').trim();
+            const sk = String(body.sk || '').trim();
+            const mineruToken = String(body.mineruToken || '').trim();
+            const mineruModel = String(body.mineruModel || '').trim();
+            const test = String(body.test || '').trim();
+            const testEngine = String(body.testEngine || '').trim();
+            if (['baidu', 'mineru', 'mineru-pro', 'auto'].includes(engine)) args.push('--engine', engine);
+            if (ak) args.push('--ak', ak);
+            if (sk) args.push('--sk', sk);
+            if (mineruToken) args.push('--mineru-token', mineruToken);
+            if (mineruModel) args.push('--mineru-model', mineruModel);
+            if (String(body.baiduLimit || '').trim()) args.push('--baidu-limit', String(body.baiduLimit).trim());
+            if (String(body.mineruLimit || '').trim()) args.push('--mineru-limit', String(body.mineruLimit).trim());
+            if (body.resetUsage) args.push('--reset-usage');
+            if (body.check) args.push('--check');
+            if (test) args.push('--test', test);
+            if (testEngine) args.push('--test-engine', testEngine);
+          }
+          const r = await vehicleCall(args, 400000);
+          const ev = r.events.find(x => x.event === 'ocr');
+          if (!ev) return json({ ok: false, error: vehicleErr(r) }, 500);
+          return json({ ok: true, ocr: ev });
+        } catch (e) { return json({ ok: false, error: String((e && e.message) || e) }, 500); }
+      },
+    },
+    {
+      // 用量：GET 读本月（百度）/今日（MinerU 轻量、精准）已用次数与额度；POST {reset:true} 清零本周期。
+      path: PREFIX + '/vehicle/usage', methods: ['GET', 'POST'], fetch: async (req) => {
+        try {
+          const args = ['usage'];
+          if (req.method === 'POST') {
+            const body = await req.json().catch(() => ({}));
+            if (body.reset) args.push('--reset');
+          }
+          const r = await vehicleCall(args, 60000);
+          const ev = r.events.find(x => x.event === 'usage');
+          if (!ev) return json({ ok: false, error: vehicleErr(r) }, 500);
+          return json({ ok: true, usage: ev });
+        } catch (e) { return json({ ok: false, error: String((e && e.message) || e) }, 500); }
+      },
+    },
+    {
+      // 把已归档的权证上传到天源底稿「车辆」科目的「权证索引」列（后台任务 + 轮询）。
+      // body: {root, company, projectId, companyId, dryRun, overwrite}
+      path: PREFIX + '/vehicle/upload', methods: ['POST'], fetch: async (req) => {
+        try {
+          const body = await req.json().catch(() => ({}));
+          const root = String(body.root || '').trim();
+          const company = String(body.company || '').trim();
+          const projectId = String(body.projectId || '').trim();
+          const companyId = String(body.companyId || '').trim();
+          const dryRun = !!body.dryRun;
+          const overwrite = !!body.overwrite;
+          if (!root || !company) return json({ ok: false, error: '缺少 root 或 company' }, 400);
+          if (!/^\d{6,}$/.test(projectId) || !/^\d{6,}$/.test(companyId)) return json({ ok: false, error: '项目ID / 被评估单位ID 必须是底稿网址里的那两段数字' }, 400);
+          const jobId = 'vup-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 6);
+          const jobs = G.__dshVehicleUploads || (G.__dshVehicleUploads = new Map());
+          const st = { at: Date.now(), status: 'running', message: '整理待上传文件…', total: 0, done: 0,
+            uploaded: [], skipped: [], failed: [], logs: [], saved: null, subjectCode: '', dir: '', dryRun };
+          jobs.set(jobId, st);
+          const pushLog = (m) => { const cur = jobs.get(jobId); if (!cur) return; cur.logs.push(String(m)); if (cur.logs.length > 300) cur.logs.splice(0, cur.logs.length - 300); };
+          (async () => {
+            let staged = [];
+            try {
+              const r = await vehicleSpawn(['stage', '--root', root, '--company', company], ev => {
+                const cur = jobs.get(jobId);
+                if (!cur) return;
+                if (ev.event === 'log') pushLog(ev.msg || '');
+                else if (ev.event === 'stage') { staged = ev.items || []; cur.total = staged.length; cur.dir = ev.dir || ''; }
+                else if (ev.event === 'error') { cur.status = 'failed'; cur.message = ev.msg || '整理失败'; }
+              }, 900000);
+              const cur = jobs.get(jobId) || st;
+              if (cur.status === 'failed') { cur.at = Date.now(); return; }
+              if (!staged.length) { cur.status = 'failed'; cur.message = '没有可上传的权证文件：请先跑一次识别归档'; cur.at = Date.now(); return; }
+              cur.message = (dryRun ? '试运行：比对底稿现状…' : '开始上传 ') + (dryRun ? '' : staged.length + ' 份附件');
+              pushLog('待上传 ' + staged.length + ' 份（目录 ' + cur.dir + '）');
+              const res = await uploadVehicleCerts({
+                projectId, companyId, dir: cur.dir,
+                items: staged.map((it, i) => ({ idx: String(i + 1), plate: it.plate, type: it.type, name: it.name })),
+                dryRun, overwrite, log: pushLog,
+              });
+              cur.uploaded = res.uploaded || [];
+              cur.skipped = res.skipped || [];
+              cur.failed = res.failed || [];
+              cur.saved = res.saved || null;
+              cur.subjectCode = res.subjectCode || '';
+              cur.done = (res.uploaded || []).length;
+              const bad = cur.failed.length;
+              cur.status = bad && !cur.uploaded.length ? 'failed' : 'done';
+              cur.message = (dryRun ? '试运行完成：' : '上传完成：')
+                + (dryRun ? '可上传 ' : '已上传 ') + cur.uploaded.length
+                + ' · 跳过 ' + cur.skipped.length + ' · 失败 ' + bad
+                + (cur.saved ? '（保存 ' + (cur.saved.code === 200 ? '成功' : '失败：' + (cur.saved.msg || '')) + '）' : '');
+              cur.at = Date.now();
+            } catch (e) {
+              const cur = jobs.get(jobId);
+              if (cur) {
+                cur.status = 'failed';
+                cur.message = String((e && e.detail) || (e && e.message) || e);
+                pushLog((e && e.message ? e.message + ' ' : '') + String((e && e.detail) || ''));
+                cur.at = Date.now();
+              }
+            }
+          })();
+          return json({ ok: true, jobId });
+        } catch (e) { return json({ ok: false, error: String((e && e.message) || e) }, 500); }
+      },
+    },
+    {
+      // 上传任务进度
+      path: PREFIX + '/vehicle/upload/progress', methods: ['GET'], fetch: async (req) => {
+        const u = new URL(req.url, 'http://127.0.0.1');
+        const jobId = String(u.searchParams.get('jobId') || '').trim();
+        const jobs = G.__dshVehicleUploads;
+        const st = jobs && jobs.get(jobId);
+        if (!st) return json({ ok: true, job: { status: 'unknown' } });
+        return json({ ok: true, job: { status: st.status, message: st.message, total: st.total, done: st.done,
+          subjectCode: st.subjectCode, uploaded: st.uploaded, skipped: st.skipped, failed: st.failed,
+          saved: st.saved, dryRun: st.dryRun, logs: st.logs.slice(-60) } });
+      },
+    },
+    {
+      // 读回天源底稿现状：每行车牌 + 权证索引里已挂的附件（只读，不需要编辑锁）
+      path: PREFIX + '/vehicle/upload/state', methods: ['GET'], fetch: async (req) => {
+        try {
+          const u = new URL(req.url, 'http://127.0.0.1');
+          const projectId = String(u.searchParams.get('projectId') || '').trim();
+          const companyId = String(u.searchParams.get('companyId') || '').trim();
+          if (!/^\d{6,}$/.test(projectId) || !/^\d{6,}$/.test(companyId)) return json({ ok: false, error: '项目ID / 被评估单位ID 必须是底稿网址里的那两段数字' }, 400);
+          const res = await readVehicleCerts({ projectId, companyId, log: () => {} });
+          return json({ ok: true, subjectCode: res.subjectCode, rows: res.rows, items: res.items });
+        } catch (e) { return json({ ok: false, error: String((e && e.detail) || (e && e.message) || e) }, 500); }
+      },
+    },
     {
       // 项目下的被评估公司 **及每家公司配置了哪些报告类型**。
       //
@@ -2370,27 +2714,19 @@ export function apply(ctx) {
               await mkdir(outDir, { recursive: true });
             }
             const setProg = patch => { if (exportProgress.size > 50) { let oldest = null; for (const [k, v] of exportProgress) if (!oldest || v.at < oldest.at) oldest = { k, at: v.at }; if (oldest) exportProgress.delete(oldest.k); } exportProgress.set(jobId, { at: Date.now(), ...patch }); };
-            setProg({ status: 'running', stage: 'running', total: items.length, done: 0, pct: 0, files: [], errors: [], outDir, message: '连接你的浏览器…' });
+            setProg({ status: 'running', stage: 'running', total: items.length, done: 0, files: [], errors: [], outDir, message: '连接你的浏览器…' });
 
             (async () => {
               try {
-                setProg({ status: 'running', stage: 'running', total: items.length, done: 0, pct: 0, files: [], errors: [], outDir, engine: 'browser', message: '正在驱动你的浏览器执行导出…' });
+                setProg({ status: 'running', stage: 'running', total: items.length, done: 0, files: [], errors: [], outDir, engine: 'browser', message: '正在驱动你的浏览器执行导出…' });
                 const normItems = items.map(i => ({ companyId: String(i.companyId), companyName: i.companyName || '', type: Number(i.type), mode: i.mode }));
                 if (!rb.resolveOpencliBin()) {
-                  setProg({ status: 'failed', stage: 'failed', total: items.length, done: 0, pct: 0, files: [], errors: ['未找到 opencli（你的浏览器通道）。请安装 opencli 后重试。'], outDir, message: '缺少 opencli' });
+                  setProg({ status: 'failed', stage: 'failed', total: items.length, done: 0, files: [], errors: ['未找到 opencli（你的浏览器通道）。请安装 opencli 后重试。'], outDir, message: '缺少 opencli' });
                   return;
                 }
                 const r = await rb.exportReports({
                   projectId, items: normItems,
                   onLog: (m) => { const cur = exportProgress.get(jobId); if (cur) setProg({ ...cur, at: Date.now(), logs: [...(cur.logs || []), m].slice(-200) }); },
-                  // 抓取阶段占总进度的 0~80%：下载完还要逐份校验、归正字体、排表格，
-                  // 那段时间同样在等，不能让进度条停在 80% 装死。
-                  onProgress: (p) => {
-                    const cur = exportProgress.get(jobId); if (!cur) return;
-                    const total = Math.max(1, Number(p.total) || normItems.length || 1);
-                    const pct = Math.min(80, Math.round((Math.max(0, Number(p.done) || 0) / total) * 80));
-                    setProg({ ...cur, at: Date.now(), stage: 'fetching', done: Math.max(0, Number(p.done) || 0), total, pct, message: p.message || cur.message });
-                  },
                 });
                 if (!r || !r.ok) {
                   const notLogged = r && (r.code === 'NOT_LOGGED_IN' || r.code === 'BRIDGE_DISCONNECTED');
@@ -2399,20 +2735,12 @@ export function apply(ctx) {
                     ? String((r && r.detail) || (r && r.msg) || '连不上浏览器')
                     : notLogged ? '你的浏览器未登录天源：请在浏览器里登录一次后重试'
                     : String((r && (r.msg || r.code || r.detail)) || '导出失败');
-                  // 失败也代表作业结束：不要把进度条打回 0，否则用户看到「跑着跑着归零」。
-                  // 抓取阶段的进度保留在 cur 里，界面按已推进到哪一步显示。
-                  const curFail = exportProgress.get(jobId) || {};
-                  setProg({ status: 'failed', stage: 'failed', total: items.length, done: curFail.done || 0, pct: (curFail.pct == null ? 0 : curFail.pct), files: [], errors: [msg], outDir, engine: 'browser', message: bridgeDown ? '连不上浏览器' : (notLogged ? '需要登录天源' : '导出失败'), logs: (r && r.logs) || [] });
+                  setProg({ status: 'failed', stage: 'failed', total: items.length, done: 0, files: [], errors: [msg], outDir, engine: 'browser', message: bridgeDown ? '连不上浏览器' : (notLogged ? '需要登录天源' : '导出失败'), logs: (r && r.logs) || [] });
                   return;
                 }
                 const files = []; const errors = Array.isArray(r.errors) ? r.errors.slice() : [];
                 const fmtErrors = [];
-                const totalFiles = (r.files || []).length;
-                let procIndex = 0;
                 for (const f of (r.files || [])) {
-                  const curP = exportProgress.get(jobId);
-                  if (curP) setProg({ ...curP, at: Date.now(), stage: 'writing', pct: 80 + Math.round((procIndex / Math.max(1, totalFiles)) * 20), message: '正在保存并排版第 ' + (procIndex + 1) + ' / ' + totalFiles + ' 份：' + (f.companyName || '') + ' ' + (({ 1: '评估报告', 2: '评估说明', 3: '长投说明' })[Number(f.type)] || '') });
-                  procIndex += 1;
                   try {
                     const buf = Buffer.from(String(f.base64 || ''), 'base64');
                     // 产物完整性校验：不凭扩展名与退出码。完整解析 ZIP + 必需部件，
@@ -2522,13 +2850,12 @@ export function apply(ctx) {
                 }
                 setProg({
                   status: okAll ? 'done' : (files.length ? 'partial' : 'failed'), stage: okAll ? 'done' : (files.length ? 'partial' : 'failed'),
-                  total: items.length, done: items.length, pct: 100, files, errors, outDir, applyFormat, engine: 'browser',
+                  total: items.length, done: items.length, files, errors, outDir, applyFormat, engine: 'browser',
                   message: okAll ? ('完成：' + files.length + ' 份原生文档' + suffix) : (files.length ? ('部分完成：' + files.length + ' 份成功，' + errors.length + ' 项失败') : '导出失败'),
                   logs: r.logs || [],
                 });
               } catch (e) {
-                const curEx = exportProgress.get(jobId) || {};
-                setProg({ status: 'failed', stage: 'failed', total: items.length, done: curEx.done || 0, pct: (curEx.pct == null ? 0 : curEx.pct), files: [], errors: [String(e.message || e)], outDir, message: '作业异常' });
+                setProg({ status: 'failed', stage: 'failed', total: items.length, done: 0, files: [], errors: [String(e.message || e)], outDir, message: '作业异常' });
               }
             })();
             return json({ ok: true, jobId, outDir });
@@ -2872,10 +3199,8 @@ export function apply(ctx) {
           // 串行执行各类型；任一类型失败记录错误继续其余类型。
           (async () => {
             const files = [], errors = [];
-            for (let typeIndex = 0; typeIndex < types.length; typeIndex++) {
-              const t = types[typeIndex];
+            for (const t of types) {
               const typeName = TYPE_NAMES[t];
-              const basePct = Math.round((typeIndex / Math.max(1, types.length)) * 100);
               // 每次调用使用独立目录，绝不把上次遗留的 Word 当成本次产物。
               let outDir;
               try {
@@ -2886,13 +3211,13 @@ export function apply(ctx) {
                 errors.push(typeName + '：无法创建导出批次：' + String(e.message || e));
                 continue;
               }
-              exportProgress.set(jobId, { at: Date.now(), status: 'running', stage: 'running', outDir, pct: basePct, message: `正在导出「${typeName}」（拉取数据、变量并生成官方格式 Word）…` });
+              exportProgress.set(jobId, { at: Date.now(), status: 'running', stage: 'running', outDir, message: `正在导出「${typeName}」（拉取数据、变量并生成官方格式 Word）…` });
               const args = ['export-report-docx', '--project', projectId, '--type', String(t), '--out', outDir];
               if (companyIds) args.push('--company', companyIds); else args.push('--company-all');
               const res = await new Promise(resolve => {
                 const child = spawn(cli, args, { stdio: ['ignore', 'pipe', 'pipe'] });
                 let cout = '', cerr = '';
-                child.stdout.on('data', d => { cout += d; const cur = exportProgress.get(jobId); if (cur) exportProgress.set(jobId, { ...cur, at: Date.now(), status: 'running', stage: 'running', outDir, pct: basePct, message: `「${typeName}」` + (tail(cout, 1) || '导出中…') }); });
+                child.stdout.on('data', d => { cout += d; if (exportProgress.get(jobId)) exportProgress.set(jobId, { at: Date.now(), status: 'running', stage: 'running', outDir, message: `「${typeName}」` + (tail(cout, 1) || '导出中…') }); });
                 child.stderr.on('data', d => { cerr += d; });
                 child.on('error', e => { cerr += String(e); });
                 // 把 code 与输出一起返回，避免在 Promise 作用域外引用局部变量。
@@ -2911,7 +3236,7 @@ export function apply(ctx) {
               if (dir.startsWith(st0.dir) || dir.startsWith(root)) rememberExportBatch(dir);
             }
             const okAll = errors.length === 0;
-            exportProgress.set(jobId, { at: Date.now(), status: okAll ? 'done' : files.length ? 'partial' : 'failed', stage: okAll ? 'done' : files.length ? 'partial' : 'failed', outDir: root, pct: 100, files, message: okAll ? `完成：生成 ${files.length} 份 Word` : (files.length ? `部分完成（${files.length} 份）。失败：${errors.join('；')}` : '导出失败：' + errors.join('；')) });
+            exportProgress.set(jobId, { at: Date.now(), status: okAll ? 'done' : files.length ? 'partial' : 'failed', stage: okAll ? 'done' : files.length ? 'partial' : 'failed', outDir: root, files, message: okAll ? `完成：生成 ${files.length} 份 Word` : (files.length ? `部分完成（${files.length} 份）。失败：${errors.join('；')}` : '导出失败：' + errors.join('；')) });
           })();
           return json({ ok: true, jobId, outDir: root });
         } catch (e) { return json({ ok: false, error: String(e.message || e) }, 500); }
@@ -2973,21 +3298,22 @@ export function apply(ctx) {
       },
     },
     {
+      // 仅列出用户指定目录的工作簿，不跟随目录项中的符号链接。
       path: PREFIX + '/ty/export/files', methods: ['POST'], fetch: async (req) => {
-          try {
-            const b = await req.json();
-            if (typeof b.dir !== 'string' || !isAbsolute(b.dir)) return json({ ok: false, error: '请填写文件夹绝对路径' }, 400);
-            const dir = await realpath(b.dir);
-            if (!(await stat(dir)).isDirectory()) return json({ ok: false, error: '请选择文件夹' }, 400);
-            const entries = await readdir(dir, { withFileTypes: true });
-            const files = entries.filter(e => e.isFile() && /\.(xlsx|xlsm)$/i.test(e.name)).map(e => ({ name: e.name, path: join(dir, e.name) })).sort((a, b) => a.name.localeCompare(b.name));
-            return json({ ok: true, dir, files: files.slice(0, 500), truncated: files.length > 500 });
-          } catch (_) { return json({ ok: false, error: '无法读取该文件夹' }, 400); }
-        },
+        try {
+          const b = await req.json();
+          if (typeof b.dir !== 'string' || !isAbsolute(b.dir)) return json({ ok: false, error: '请填写文件夹绝对路径' }, 400);
+          const dir = await realpath(b.dir);
+          if (!(await stat(dir)).isDirectory()) return json({ ok: false, error: '请选择文件夹' }, 400);
+          const entries = await readdir(dir, { withFileTypes: true });
+          const files = entries.filter(e => e.isFile() && /\.(xlsx|xlsm)$/i.test(e.name)).map(e => ({ name: e.name, path: join(dir, e.name) })).sort((a, b) => a.name.localeCompare(b.name));
+          return json({ ok: true, dir, files: files.slice(0, 500), truncated: files.length > 500 });
+        } catch (_) { return json({ ok: false, error: '无法读取该文件夹' }, 400); }
       },
-      {
-        // 手动整理始终输出到独立批次，不覆盖用户选择的源工作簿。
-        path: PREFIX + '/ty/export/manual', methods: ['POST'], fetch: async (req) => {
+    },
+    {
+      // 手动整理始终输出到独立批次，不覆盖用户选择的源工作簿。
+      path: PREFIX + '/ty/export/manual', methods: ['POST'], fetch: async (req) => {
         try {
           const body = await req.json();
           const jobId = /^[A-Za-z0-9_-]{6,64}$/.test(String(body.jobId || '')) ? String(body.jobId) : '';
@@ -3820,6 +4146,38 @@ export function apply(ctx) {
           return json({ ok: false, error: String((e && e.message) || e).slice(0, 300) }, 502);
         }
       },
+      // 财务报表读取（审定报表「资」「利」→ 天源科目明细）：POST /project/finance/statements?name=xx.xlsm
+      // 请求体是文件原始字节；返回 statements[]，每项带 sheetData。
+      path: PREFIX + '/project/finance/statements', methods: ['POST'], fetch: async (req) => {
+        try {
+          const u = new URL(req.url || '/', 'http://workbench.local');
+          const rawName = decodeURIComponent(u.searchParams.get('name') || 'statement.xlsm');
+          const name = safeFileSegment(rawName) || ('statement-' + Date.now() + '.xlsm');
+          const buf = Buffer.from(await req.arrayBuffer());
+          if (!buf.length) return json({ ok: false, error: '文件内容为空' }, 400);
+          if (buf.length > 24 * 1024 * 1024) return json({ ok: false, error: '文件超过 24 MB' }, 400);
+          const { dir } = await store.config();
+          const tmpDir = join(dir, '.tmp');
+          await mkdir(tmpDir, { recursive: true });
+          const tmp = join(tmpDir, 'statement-' + Date.now() + '-' + name);
+          await writeFile(tmp, buf);
+          const periods = String(u.searchParams.get('periods') || '').replace(/[^0-9]/g, '').slice(0, 1);
+          const basedate = String(u.searchParams.get('basedate') || '').replace(/[^0-9-]/g, '').slice(0, 10);
+          const extra = [];
+          if (periods) extra.push('--periods', periods);
+          if (basedate) extra.push('--basedate', basedate);
+          let out;
+          try {
+            out = await financeStatementScript(['tmp', '--mode', 'statements'].concat(extra));
+          } finally {
+            try { await rm(tmp, { force: true }); } catch (e) {}
+          }
+          out.file = name;
+          return json(out);
+        } catch (e) {
+          return json({ ok: false, error: String((e && e.message) || e).slice(0, 300) }, 400);
+        }
+      },
     },
     {
       // 项目文件夹模板：POST /project/folders/build { folder, companies:[{ name, methods:{whole,part}, subjects:[{name,amount}] }] }
@@ -4002,6 +4360,9 @@ export function apply(ctx) {
           // （改完 library.js 却没重启时这里会是 false，能一眼看出代码没换）
           libRev: typeof lib.resolveLibPath === 'function' ? 'rev13' : 'old',
           // 数据落盘层（默认目录 / 配置文件路径）也在标记里露一眼，排障时不用反查代码
+          storeRev: typeof store.writeState === 'function' ? 'rev13' : 'old',
+          // 数据工具（/dt/*）宿主半侧版本：null = 这一版还没加载 data-tools.js
+          dataToolsRev: DATA_TOOLS_REV || null,
           // rev14 = store.js 里带 describeFolder/resolveProjectDir（绑定任意本地目录的那版）。
           // 这行是排障证据：宿主进程缓存了旧 store.js 时会显示 old/rev13，一眼看出绑定功能没生效。
           storeRev: typeof store.describeFolder === 'function' ? 'rev14-bind' : (typeof store.writeState === 'function' ? 'rev13' : 'old'),
@@ -4261,7 +4622,7 @@ export function apply(ctx) {
       parameters: {
         type: 'object',
         properties: {
-          kind: { type: 'string', enum: ['detail', 'declare'], description: 'detail 导出明细表（默认恢复公式并设置格式）；declare 导出申报表（设置申报表格式并做安全增删行，不恢复公式）。' },
+          kind: { type: 'string', enum: ['detail', 'declare'], description: 'detail 导出明细表（默认恢复公式并设置格式）；declare 导出申报表（只设置申报表格式，不恢复公式）。' },
           projectId: { type: 'string', pattern: '^[0-9]+$', description: '天源数字项目 ID，等于 workbench_projects 返回的 tyId。' },
           projectCode: { type: 'string', description: '可选：项目编号，仅用于拼输出目录名，例如「20261110001」。' },
           projectName: { type: 'string', description: '可选：项目简称，仅用于拼输出目录名。' },

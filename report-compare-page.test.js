@@ -66,6 +66,9 @@ function makeRuntime() {
       return hooks[key].v;
     },
     useCallback(fn, deps) { return React.useMemo(() => fn, deps); },
+    // client.js 顶层 class WbErrorBoundary extends React.Component 在模块求值时立即执行，
+    // shim 必须提供基类（测试里不渲染它，只要存在即可）。
+    Component: function WbErrorBoundaryShim(props) { return null; },
     useRef(init) {
       const i = hookIndex++;
       if (!(i in hooks)) hooks[i] = { current: init };
