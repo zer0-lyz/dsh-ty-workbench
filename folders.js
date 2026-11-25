@@ -8,6 +8,8 @@
 //   3) 财务类资料（00财务资料）与基础类资料（02基础类）**每家公司一套**，
 //      分类在前、公司在后：00财务资料/<公司>、02基础类/<公司>/<分类>，
 //      与 03资产基础法/<公司>/<科目> 的写法一致；
+//      00财务资料/<公司> 下固定一个 01财务报表 子夹：客户给的各期报表原件放这里，
+//      「导入报表」按这个夹扫描解析（见 FIN_STATEMENT_DIR）；
 //   4) 03资产基础法 / 04收益法 / 05市场法 只在该公司选了对应方法时生成；
 //   5) 资产基础法下的科目子目录，只给「财务报表里有金额」的科目建。
 
@@ -65,6 +67,15 @@ export const MGMT_CATEGORIES = [
 
 // 管理类底稿落在 03评估底稿 下（与 一级复核 / 二级复核 / 三级复核 / 送签发 并列）
 export const MGMT_FOLDER = '03评估底稿/管理类底稿';
+
+// 财务报表原件夹：每家公司 00财务资料/<公司> 下的固定子夹，客户给的各期报表（月报/年报、
+// 审定报表、报表附注）放这里，「导入报表」就扫这个夹里的 xlsx/xls/xlsm 自动解析。
+export const FIN_STATEMENT_DIR = '01财务报表';
+// 审计报告夹：每家公司 00财务资料/<公司> 下的固定子夹，事务所出具的审计报告 PDF/word 放这里。
+export const AUDIT_REPORT_DIR = '02审计报告';
+// 认定是「报表原件」的扩展名，与 finance_scan.py 的 EXTS 保持一致
+// （csv 不在内：报表得靠工作表结构认「项目 + 行次」表头，纯文本 csv 没有这个概念）
+export const FIN_STATEMENT_EXTS = ['.xlsx', '.xlsm', '.xls'];
 
 // 资产基础法科目：目录名（与模板编号一致）+ 命中关键字（科目余额表里的叫法）
 export const AB_SUBJECTS = [
@@ -203,6 +214,9 @@ export function planProjectFolders(input) {
     const base = '02现场资料/企业提供资料/';
     // 财务类资料 + 基础类资料：每家公司一套（分类在前、公司在后）
     push(base + '00财务资料/' + seg);
+    // 报表原件夹：公司夹下固定一层，导入报表就按这个夹扫描
+    push(base + '00财务资料/' + seg + '/' + FIN_STATEMENT_DIR);
+    push(base + '00财务资料/' + seg + '/' + AUDIT_REPORT_DIR);
     push(base + '02基础类/' + seg);
     BASIC_CATEGORIES.forEach(cat => push(base + '02基础类/' + seg + '/' + safeSeg(cat)));
 
