@@ -1,6 +1,6 @@
 {
   "name": "@zer0_y/dsh-ty-workbench",
-  "version": "1.0.3",
+  "version": "1.0.4",
   "private": false,
   "type": "module",
   "description": "个人工作台：资产评估项目管理与工时、考证学习规划与考试提醒、自选股行情与买卖点提醒",
