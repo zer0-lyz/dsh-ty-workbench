@@ -3290,6 +3290,104 @@ window.__ModuleLoader__.load({
           toast('从天源同步失败：' + String((err && err.message) || err), 'warn');
         } finally { setBusy(''); }
       };
+      // 从天源拉当前公司的查证资料（对接第 2 步·下载方向）：
+      // /ty/report-companies 定位天源公司 → /ty/file-list 拉全项目文件 → 按 parentPath 过滤出
+      // 「资产基础法/…/（查证资料|盘点|担保|科目通用文件|其他）」里属于当前公司的 →
+      // 逐个 /ty/file-download 落盘到本地 <科目夹>/查证资料（天源科目名 → 本地模板科目夹名）。
+      // 注意天源科目名（现金/银行存款/长期借款/产成品…）与本地夹名（01货币资金/07存货/20短期借款…）不一致，
+      // 用 folders.js 的同一套关键词表（AB_TABLE 对应 host 的 AB_SUBJECTS）映射。
+      const pullFiles = async () => {
+        if (!cur) return;
+        const tid = String((project && project.tyId) || '').trim();
+        if (!/^\d+$/.test(tid)) { toast('该项目还没绑定天源项目，先在项目行「绑定天源」', 'warn'); return; }
+        if (!projectAbs(project)) { toast('该项目还没绑定本地文件夹', 'warn'); return; }
+        setBusy('pull');
+        let done = 0; let failed = 0; let skip = 0; let lastErr = '';
+        try {
+          const rc = await fetch(PREFIX + '/ty/report-companies?projectId=' + encodeURIComponent(tid), { cache: 'no-store' });
+          const rcj = await rc.json().catch(() => ({}));
+          if (!rc.ok || !rcj.ok) throw new Error((rcj && rcj.error) || ('HTTP ' + rc.status));
+          const tyCos = Array.isArray(rcj.companies) ? rcj.companies : [];
+          const hit = tyCos.filter(c => normName(c && c.name) === normName(cur.name))[0]
+            || tyCos.filter(c => normName(c && c.name).indexOf(normName(cur.name)) >= 0 || normName(cur.name).indexOf(normName(c && c.name)) >= 0)[0];
+          if (!hit || !/^\d+$/.test(String((hit && hit.id) || ''))) throw new Error('天源项目里没找到同名公司「' + cur.name + '」');
+          const cidTy = Number(hit.id);
+          // 拉全量（100/页），只留资产基础法下、当前公司的证据类文件
+          const all = [];
+          for (let p = 1; p <= 10; p += 1) {
+            const lr = await fetch(PREFIX + '/ty/file-list?projectId=' + tid + '&companyId=' + cidTy + '&pageNum=' + p + '&pageSize=100', { cache: 'no-store' });
+            const ld = await lr.json().catch(() => ({}));
+            if (!lr.ok || !ld.ok) throw new Error((ld && ld.error) || ('HTTP ' + lr.status));
+            (ld.files || []).forEach(f => all.push(f));
+            if (!ld.pagination || !ld.pagination.hasNext) break;
+          }
+          const kindRe = /(查证资料|盘点|担保|科目通用文件|其他)$/;
+          const targets = all.filter(f => /^资产基础法\//.test(f.parentPath || '') && kindRe.test(f.parentPath || '') && f.attachId);
+          if (!targets.length) { toast('天源这家公司还没有「查证资料」类文件（先在天源传）', 'warn'); return; }
+          // 天源科目 → 本地科目夹：用与 host folders.js 同一套关键词
+          const abKeys = [
+            ['01货币资金', '货币资金|库存现金|银行存款|其他货币资金'],
+            ['02交易性金融资产', '交易性金融资产'],
+            ['03应收票据', '应收票据'],
+            ['04应收账款', '应收账款|应收帐款'],
+            ['05预付款项', '预付款项|预付账款|预付帐款|预付'],
+            ['06其他应收款', '其他应收款'],
+            ['07存货', '存货|原材料|库存商品|在产品|半成品|周转材料|发出商品|委托加工物资|低值易耗品|产成品'],
+            ['08合同资产', '合同资产'],
+            ['09持有待售资产', '持有待售'],
+            ['10一年内到期的非流动资产', '一年内到期'],
+            ['11投资性房地产', '投资性房地产'],
+            ['12固定资产', '固定资产|房屋建筑物|机器设备|电子设备|车辆'],
+            ['13在建工程', '在建工程|设备安装工程'],
+            ['14生产性生物资产', '生物资产'],
+            ['15无形资产', '无形资产|土地使用权|软件'],
+            ['18递延所得税资产', '递延所得税资产'],
+            ['20短期借款', '短期借款'],
+            ['21交易性金融负债', '交易性金融负债'],
+            ['22应付票据', '应付票据'],
+            ['23应付账款', '应付账款|应付帐款'],
+            ['24预收款项', '预收款项|预收账款'],
+            ['25应付职工薪酬', '应付职工薪酬|职工薪酬'],
+            ['26应交税费', '应交税费'],
+            ['27其他应付款', '其他应付款'],
+            ['29一年内到期的非流动负债', '一年内到期'],
+            ['31长期借款', '长期借款'],
+            ['32应付债券', '应付债券'],
+            ['35递延所得税负债', '递延所得税负债'],
+          ];
+          const segOf = f => {
+            const segs = String(f.parentPath || '').split('/');
+            // 资产基础法/<科目>/<类型>：科目在第 2 段
+            const subj = segs[1] || '';
+            const hitSeg = abKeys.filter(([fo, keys]) => keys.split('|').some(k => subj.indexOf(k) >= 0))[0];
+            return hitSeg ? hitSeg[0] : '';
+          };
+          for (const f of targets) {
+            const localSeg = segOf(f);
+            if (!localSeg) { skip += 1; continue; }
+            const kind = String(f.parentPath).split('/').pop();
+            // 天源「查证资料/盘点/担保/科目通用文件/其他」都归到本地「查证资料」夹（本地只有查证资料层）
+            const sub = ['03资产基础法', cur.name, localSeg, '查证资料'];
+            try {
+              const dr = await fetch(PREFIX + '/ty/file-download', {
+                method: 'POST', headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ abs: projectAbs(project), sub: sub, attachId: f.attachId, name: f.fileName }),
+              });
+              const dd = await dr.json().catch(() => ({}));
+              if (!dr.ok || !dd.ok) throw new Error((dd && dd.error) || ('HTTP ' + dr.status));
+              done += 1;
+            } catch (e2) {
+              failed += 1; lastErr = String((e2 && e2.message) || e2);
+            }
+          }
+          const parts = ['拉到 ' + done + ' 个文件'];
+          if (skip) parts.push('跳过 ' + skip + ' 个（科目对不上本地模板）');
+          if (failed) parts.push('失败 ' + failed + ' 个' + (lastErr ? '：' + lastErr.slice(0, 80) : ''));
+          toast(parts.join('，'), failed ? 'warn' : 'info');
+        } catch (err) {
+          toast('从天源拉查证资料失败：' + String((err && err.message) || err), 'warn');
+        } finally { setBusy(''); }
+      };
 
       if (!cur) {
         return h('div', null, h('p', { className: 'pf-hint' }, '还没有股权信息。先到「股权信息」里添加被评估单位和子公司，再回来录财务资料。'));
@@ -3302,6 +3400,7 @@ window.__ModuleLoader__.load({
               : h('label', null, '公司', h('select', { className: 'pf-sel', value: cid, onChange: e => setWho(e.target.value) }, rows.map(r => h('option', { key: r.id, value: r.id }, r.code + ' ' + r.name)))),
             h('button', { type: 'button', className: 'pf-btn', disabled: busy === 'import', onClick: () => fileRef.current && fileRef.current.click() }, busy === 'import' ? '读取中…' : '导入科目余额表'),
             h('button', { type: 'button', className: 'pf-btn', title: '从绑定的天源项目拉这家公司资产基础法的非零科目（金额以天源为准，本地独有的科目保留）', disabled: busy === 'sync', onClick: syncTy }, busy === 'sync' ? '同步中…' : '从天源同步科目'),
+            h('button', { type: 'button', className: 'pf-btn', title: '把天源这家公司「资产基础法/*/查证资料（含盘点/担保/科目通用文件/其他）」的文件下载到本地对应科目夹', disabled: busy === 'pull', onClick: pullFiles }, busy === 'pull' ? '拉取中…' : '拉查证资料'),
             h('button', { type: 'button', className: 'pf-btn', onClick: clearAll }, '清空')),
           h('input', { type: 'file', accept: '.xlsx,.xlsm,.csv', ref: fileRef, style: { display: 'none' }, onChange: onFile }),
           h('div', { className: 'pw-acts' },

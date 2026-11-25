@@ -3739,6 +3739,89 @@ export function apply(ctx) {
       },
     },
     {
+      // 天源项目文件清单（对接第 2 步·下载方向）：GET /ty/file-list?projectId=&companyId=&keyword=&pageNum=&pageSize=
+      // MCP get_project_file_list 直连。files[].uniqueKey 尾段 = 附件 ID（download_report_attachment 用）。
+      path: PREFIX + '/ty/file-list', methods: ['GET'], fetch: async (req) => {
+        try {
+          const u = new URL(req.url || '/', 'http://workbench.local');
+          const projectId = Number(u.searchParams.get('projectId'));
+          if (!Number.isFinite(projectId) || projectId <= 0) return json({ ok: false, error: 'projectId 必须为数字' }, 400);
+          const args = { projectId, pageNum: Math.max(1, Number(u.searchParams.get('pageNum')) || 1), pageSize: Math.min(200, Math.max(1, Number(u.searchParams.get('pageSize')) || 100)) };
+          const companyId = Number(u.searchParams.get('companyId'));
+          if (Number.isFinite(companyId) && companyId > 0) args.companyId = companyId;
+          const kw = String(u.searchParams.get('keyword') || '').trim();
+          if (kw) args.keyword = kw.slice(0, 200);
+          const r = await ty.callTool('get_project_file_list', args);
+          if (!r.data || r.data.success === false) throw new Error((r.data && r.data.error) || '天源返回异常');
+          const files = (Array.isArray(r.data.files) ? r.data.files : []).map(f => ({
+            fileId: f.fileId,
+            fileName: String(f.fileName || ''),
+            parentPath: String(f.parentPath || ''),
+            sizeKb: f.sizeKb,
+            createdAt: f.createdAt || '',
+            createdBy: f.createdBy || '',
+            // uniqueKey 尾段才是附件 ID：'3.C3-1-2.2.188390320635904' → '188390320635904'
+            attachId: String(f.uniqueKey || '').split('.').pop() || '',
+          })).filter(f => f.fileName);
+          return json({
+            ok: true,
+            total: r.data.summary ? r.data.summary.totalFiles : files.length,
+            files,
+            pagination: r.data.pagination || null,
+          });
+        } catch (e) {
+          return json({ ok: false, error: String((e && e.message) || e).slice(0, 300) }, 502);
+        }
+      },
+    },
+    {
+      // 下载单个天源附件并落盘：POST /ty/file-download { projectId|abs, sub:[目录段], attachId, name }
+      // MCP download_report_attachment 返回 base64 blob → 直接写本地 <项目>/<sub>/<name>。
+      // abs/sub 与 /project/upload 同一套规则（绑定目录优先），目录不存在自动建。
+      path: PREFIX + '/ty/file-download', methods: ['POST'], fetch: async (req) => {
+        try {
+          const b = await req.json().catch(() => ({}));
+          const attachId = String((b && b.attachId) || '').trim();
+          if (!/^\d+$/.test(attachId)) return json({ ok: false, error: 'attachId 必须为数字' }, 400);
+          const fileName = safeFileSegment(b.name);
+          if (!fileName) return json({ ok: false, error: '文件名不合法' }, 400);
+          const subParts = (Array.isArray(b.sub) ? b.sub : []).map(x => cleanSegment(x, 80)).filter(Boolean);
+          if (!subParts.length || subParts.some(p => p === '.' || p === '..')) return json({ ok: false, error: '目标子目录不合法' }, 400);
+          const absBound = String((b && b.abs) || '').trim();
+          const folder = safeFolderName(b.folder);
+          let base = absBound ? await store.describeFolder(absBound, true) : null;
+          if (absBound && (!base || base.ok === false)) return json({ ok: false, error: (base && base.error) || ('项目文件夹不可用：' + absBound) }, 400);
+          if (!base || base.ok === false) {
+            const byName = folder ? await store.findProjectDir(folder) : null;
+            if (byName) base = { ok: true, ...byName };
+            else if (folder) {
+              const made = await store.projectDir(folder, true);
+              if (!made.ok) return json({ ok: false, error: made.error }, 400);
+              base = made;
+            }
+          }
+          if (!base || base.ok === false) return json({ ok: false, error: (base && base.error) || '项目文件夹不存在（先绑定本地文件夹）' }, 400);
+          const r = await ty.callTool('download_report_attachment', { attachId });
+          const blobRes = (r.content || []).filter(c => c.type === 'resource' && c.resource && c.resource.blob)[0];
+          const meta = r.data && typeof r.data === 'object' && r.data.success ? r.data : null;
+          if (!blobRes && !meta) {
+            const errTxt = (r.content || []).filter(c => c.type === 'text').map(c => c.text).join(' ').slice(0, 200)
+              || (r.data && typeof r.data === 'string' ? r.data.slice(0, 200) : '');
+            throw new Error('天源下载失败：' + (errTxt || '无附件数据'));
+          }
+          const buf = blobRes ? Buffer.from(blobRes.resource.blob, 'base64') : null;
+          if (!buf || !buf.length) throw new Error('附件内容为空');
+          const targetDir = join(base.path, ...subParts);
+          await mkdir(targetDir, { recursive: true });
+          const abs = join(targetDir, fileName);
+          await writeFile(abs, buf);
+          return json({ ok: true, path: abs, bytes: buf.length, sizeBytes: meta ? meta.sizeBytes : buf.length, fileName: meta ? meta.fileName : fileName });
+        } catch (e) {
+          return json({ ok: false, error: String((e && e.message) || e).slice(0, 300) }, 502);
+        }
+      },
+    },
+    {
       // 项目文件夹模板：POST /project/folders/build { folder, companies:[{ name, methods:{whole,part}, subjects:[{name,amount}] }] }
       // 幂等：已存在的目录跳过，只报新建了多少。模板规则全在 folders.js（planProjectFolders）。
       path: PREFIX + '/project/folders/build', methods: ['POST'], fetch: async (req) => {
