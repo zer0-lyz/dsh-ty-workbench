@@ -4400,6 +4400,7 @@ window.__ModuleLoader__.load({
       const [mode, setMode] = useState('new');     // new=按编号简称新建（模板整套目录） | bind=绑定已有目录
       const [abs, setAbs] = useState('');
       const [info, setInfo] = useState(null);
+      const [gen, setGen] = useState(null);        // { path, created, existed } 「新建」模式立即生成骨架的结果
       // 「新建」模式下的目录预览：优先取「文件夹模板」页保存的模板，取不到就用内置骨架兜底。
       const [preview, setPreview] = useState(null);
       useEffect(() => {
@@ -4438,6 +4439,17 @@ window.__ModuleLoader__.load({
         probe(got);
       };
       const canOk = mode === 'new' || (!!String(abs).trim() && !!info && !info.error);
+      // 「新建」模式：点一下就真建目录（幂等，已存在跳过）；确认绑定再走 onConfirm。
+      const genNow = async () => {
+        try {
+          const r = await fetch(PREFIX + '/project/folders/build', {
+            method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ folder: autoName, companies: [] }),
+          });
+          const d = await r.json().catch(() => ({}));
+          if (r.ok && d.ok) { setGen(d); toast('已生成项目文件夹骨架' + (d.root ? '：' + d.root : ''), 'ok'); }
+          else toast('生成失败：' + ((d && d.error) || ('HTTP ' + r.status)), 'warn');
+        } catch (e) { toast('生成失败：' + String((e && e.message) || e), 'warn'); }
+      };
       return h(Modal, { title: '绑定本地文件夹 · ' + (p.projectName || '未命名'), onClose: busy ? () => {} : onCancel, style: { maxWidth: 700 } },
         h('p', { className: 'pf-hint', style: { margin: '0 0 12px' } },
           esc(p.projectCode || '无编号'), p.assessmentObject ? ' · ' + esc(p.assessmentObject) : '', ' · 绑定后本地项目与天源项目一一对应，之后同步/打开都认这条关系。'),
@@ -4450,7 +4462,13 @@ window.__ModuleLoader__.load({
             h('div', { style: { border: '1px solid var(--dsw-alias-border-l2,#ddd)', borderRadius: 8, padding: '8px 10px', fontSize: 12, maxHeight: 220, overflow: 'auto' } },
               previewGroups.map(g => renderPreviewNode(g, 0))),
             h('div', { style: { marginTop: 8, color: 'var(--dsw-alias-label-secondary,#777)' } },
-              '各被评估单位的 00财务资料 / 02基础类 / 03资产基础法 / 04收益法 / 05市场法 子目录，会在填好被评估单位与评估方法后自动补齐。'))
+              '各被评估单位的 00财务资料 / 02基础类 / 03资产基础法 / 04收益法 / 05市场法 子目录，会在填好被评估单位与评估方法后自动补齐。'),
+            h('div', { className: 'wb-row', style: { justifyContent: 'flex-end', marginTop: 10, gap: 8 } },
+              gen && gen.root
+                ? h('span', { className: 'pf-hint', style: { marginRight: 'auto' } },
+                  '已就绪：', h('code', null, esc(gen.root)), '（' + (gen.created || 0) + ' 新建 / ' + (gen.existed || 0) + ' 已存在）')
+                : null,
+              h('button', { type: 'button', className: 'pf-btn', disabled: !!busy, onClick: genNow }, '立即按模板生成文件夹')))
           : h('div', null,
             h('div', { className: 'pf-folder' },
               h('input', {
@@ -9544,7 +9562,7 @@ window.__ModuleLoader__.load({
       const [dockOpen, setDockOpen] = useState(false);
       // 页签精简（2026-11-18）：只保留 工作/文件库/设置。历史存档里的旧 activeTab
       // （overview/study/stock/alerts）一律回落到 work，避免渲染无页签高亮的孤儿页。
-      const KEPT = ['work', 'assistant', 'library', 'report-format', 'report-compare', 'data-tools', 'land-market', 'settings'];
+      const KEPT = ['work', 'assistant', 'library', 'report-format', 'report-compare', 'data-tools', 'land-market', 'folder-template', 'settings'];
       const tab = KEPT.includes(s.settings.activeTab) ? s.settings.activeTab : 'work';
       // 提示条：后一条提示必须顶掉前一条**连同它的定时器** —— 否则 3.2 秒前那条提示的
       // 定时器会把刚弹出的新提示提前清掉（保存 = 停在表单后连着点几下就能撞上）。
