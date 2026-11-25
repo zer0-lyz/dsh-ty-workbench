@@ -3966,7 +3966,7 @@ window.__ModuleLoader__.load({
       });
       // 本地已存的各期（「01财务报表」一次扫出来多期时都在 byYear 里），按年度倒序
       const localByYear = sd.byYear || {};
-      const localYears = Object.keys(localByYear).map(Number).filter(y => y > 0).sort((a, b) => b - a);
+      const localYears = Object.keys(localByYear).map(Number).filter(y => y > 0).sort((a, b) => a - b);
       // 把本地多期摊成 「天源科目 → {年度: 金额}」，直接复用 fsBlankTable 的列渲染
       const localMemo = new Map();
       localYears.forEach(y => {
@@ -5547,8 +5547,8 @@ window.__ModuleLoader__.load({
     // 唯一还需要 React 的两件事：toast（顶层 setState 生效）和 onDirtyChange（离页提示）。
     const FTPL = {
       tpl: null, saved: null, isDefault: true, busy: false, loadError: null,
-      confirmDel: '', loading: false, loaded: false, ctx: null, rev: 'r20261126-0040',
-      mountScheduled: false, dropTimer: null, notifyTimer: null,
+      confirmDel: '', loading: false, loaded: false, ctx: null, rev: 'r20261126-0045',
+      mountScheduled: false, dropTimer: null, notifyTimer: null, watchTimer: null,
     };
     function ftplEl(tag, props, children) {
       const n = document.createElement(tag);
@@ -5559,7 +5559,7 @@ window.__ModuleLoader__.load({
         else if (k === 'text') n.textContent = v;
         else if (k === 'style') Object.assign(n.style, v);
         else if (k === 'disabled') n.disabled = !!v;
-        else if (k.slice(0, 2) === 'on' && typeof v === 'function') n.addEventListener(k.slice(2), v);
+        else if (k.slice(0, 2) === 'on' && typeof v === 'function') n.addEventListener(k.slice(2).toLowerCase(), v);
         else n.setAttribute(k, String(v));
       });
       (children || []).forEach(c => {
@@ -5787,14 +5787,28 @@ window.__ModuleLoader__.load({
         root.appendChild(tree);
       }
       root.appendChild(ftplEl('div', { class: 'wb-hint', id: 'ftpl-count', text: ftplCountText(), style: { marginTop: '8px' } }));
+      root.__ftplPainted = true;   // 供看门狗识别：React 重渲染若换了新 div，这个标记会丢
+    }
+    // 看门狗：宿主 shim 在任何顶层 setState（toast/页签/脏标记）触发重渲染时，
+    // 可能会把 #ftpl-root 里我们手工挂的 DOM 清掉，而且不一定重新调用本组件——
+    // 表现就是「页签还在、内容区全黑」。这里每 0.7s 检查一次：挂载点还在（说明本页激活）
+    // 但内容空了且数据已就绪，就重画一次。输入框打字不会触发清空，不受影响。
+    function ftplWatch() {
+      if (FTPL.watchTimer) return;
+      FTPL.watchTimer = setInterval(() => {
+        const root = ftplRoot();
+        if (!root || !FTPL.loaded || FTPL.loading) return;
+        if (!root.childNodes.length || !root.__ftplPainted) { try { ftplPaint(); } catch (_) {} }
+      }, 350);
     }
     function ftplMount(props) {
       if (props) FTPL.ctx = props;
+      ftplWatch();
       const root = ftplRoot();
       if (!root) return;
       // React 若在重渲染时清掉了我们的外来子节点（vdom 里这个 div 没有 children），这里补挂；
       // 没被清就保持原样——正在打字的输入框才不会丢焦点。
-      if (!root.childNodes.length) ftplPaint(); else ftplHint();
+      if (!root.childNodes.length || !root.__ftplPainted) ftplPaint(); else ftplHint();
       if (!FTPL.loaded && !FTPL.loading) ftplLoad();
     }
     function FolderTemplatePage(props) {
