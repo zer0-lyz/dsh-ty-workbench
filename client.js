@@ -3321,6 +3321,7 @@ window.__ModuleLoader__.load({
       const [result, setResult] = useState(null);       // get_reports 拉回来的结果
       const fileBalRef = useRef(null);
       const fileIncRef = useRef(null);
+      const fileRef = useRef(null);                 // 「导入科目余额表」总入口（旧按钮保留，与下面分表导入并存）
       const [importKind, setImportKind] = useState('balance_sheet');
       const cur = lockId
         ? (rows.filter(r => r.id === lockId)[0] || null)
@@ -3499,6 +3500,18 @@ window.__ModuleLoader__.load({
           toast('读取天源已导入数据失败：' + String((err && err.message) || err), 'warn');
         } finally { setBusy(''); }
       };
+      // 清空当前公司当前口径的两张报表（读入的文件数据 + 天源预览），不动科目表和已建目录。
+      const clearAll = () => {
+        if (!cur) return;
+        fsUpdate(project.id, cid, mode, b => ({
+          tyProjectId: b.tyProjectId || '', tyCompanyId: b.tyCompanyId || '',
+          periods: b.periods || '',
+          balance_sheet: fsEmptyStmt(),
+          income_statement: fsEmptyStmt(),
+        }));
+        setPending(null); setResult(null);
+        toast('已清空「' + cur.name + '」' + fsModeName(mode) + '口径的资产负债表与利润表', 'info');
+      };
       // 从天源同步当前公司的资产基础法科目金额（对接第 1 步）：
       // /ty/report-companies 拿天源公司清单 → 名字归一化匹配 → /ty/ab-subjects 拉 level=2 非零科目
       // → 合并进本地科目表（同名覆盖金额，本地独有保留）→ 顺手重建项目文件夹。
@@ -3526,7 +3539,7 @@ window.__ModuleLoader__.load({
           const got = ((d.companies || [])[0] || {}).subjects || [];
           if (!got.length) { toast('天源「' + (d.companyName || hit.name) + '」没有非零科目（先在天源把底稿汇总填好）', 'warn'); return; }
           // 合并：天源科目覆盖本地同名单（金额以天源为准），本地独有的留在后面
-          const merged = subjects.slice();
+          const merged = finSubjects(s, project.id, cid).slice();
           let over = 0; let add = 0;
           got.forEach(g => {
             const nm = String(g.name || '').trim();
