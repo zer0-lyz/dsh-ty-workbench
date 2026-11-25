@@ -5026,6 +5026,7 @@ window.__ModuleLoader__.load({
       const [isDefault, setIsDefault] = useState(true);
       const [busy, setBusy] = useState(false);
       const [loadError, setLoadError] = useState(null);   // 读模板失败的原始错误（展示出来便于定位）
+      const [confirmDel, setConfirmDel] = useState('');   // 待二次确认删除的节点 path key（不用 confirm()，webview 可能禁弹窗）
       const load = async () => {
         setBusy(true); setLoadError(null);
         try {
@@ -5093,7 +5094,7 @@ window.__ModuleLoader__.load({
         setBusy(false);
       };
       const reset = async () => {
-        if (!confirm('恢复内置默认模板？当前模板会被清掉（已建好的项目目录不受影响）。')) return;
+        // 不用 confirm()（webview 可能禁弹窗）；恢复默认本身可再点「保存模板」找回，直接执行。
         setBusy(true);
         try {
           const r = await fetch(PREFIX + '/project/folders/template', { method: 'DELETE' });
@@ -5109,11 +5110,22 @@ window.__ModuleLoader__.load({
         h('div', { style: { display: 'flex', alignItems: 'center', gap: 6, padding: '3px 0' } },
           h('span', { style: { fontSize: depth === 0 ? 13 : 12, fontWeight: depth === 0 ? 600 : 400, minWidth: 18 } }, depth === 0 ? '📁' : '└'),
           h('input', {
-            className: 'pf-in', value: node.name, style: { width: Math.max(160, (node.name || '').length * 14 + 40) },
+            className: 'pf-in', value: node.name == null ? '' : String(node.name), style: { width: Math.max(160, (node.name || '').length * 14 + 40) },
             onChange: e => rename(path, e.target.value),
           }),
           h('button', { type: 'button', className: 'pf-btn sm', title: '在这下面加一层子目录', onClick: () => addChild(path), disabled: depth >= 4 }, '+ 子目录'),
-          h('button', { type: 'button', className: 'pf-btn sm', title: '删除这个目录（不影响已建好的目录）', onClick: () => { if (confirm('删除目录「' + node.name + '」及其子目录（只改模板，已存在的项目目录不会被删）？')) remove(path); } }, '删除'),
+          h('button', {
+            type: 'button', className: 'pf-btn sm',
+            style: confirmDel === path.join('.') ? { color: '#c0392b', fontWeight: 600 } : null,
+            title: '删除这个目录（不影响已建好的目录）',
+            onClick: () => {
+              // 不用 confirm()（部分宿主 webview 会禁掉弹窗，点了像没反应）；两段式：第一次点变红色「确认删除？」，再点才删，3 秒不点自动复位。
+              const k = path.join('.');
+              if (confirmDel !== k) { setConfirmDel(k); setTimeout(() => setConfirmDel(cur => (cur === k ? '' : cur)), 3000); return; }
+              setConfirmDel('');
+              remove(path);
+            },
+          }, confirmDel === path.join('.') ? '确认删除？' : '删除'),
         ),
         (node.children || []).map((c, i) => renderNode(c, path.concat(['children', i]), depth + 1)));
       const groups = tpl ? tpl.groups : [];
@@ -5688,13 +5700,25 @@ window.__ModuleLoader__.load({
         setExporting(String(d.project.id) + ':' + d.kind);
         const jobId = uid();
         const startedAt = Date.now();
-        setExportDialog(prev => ({ ...prev, status: 'running', error: '', progress: null, startedAt }));
+        setExportDialog(prev => ({ ...prev, status: 'running', error: '', progress: null, startedAt, jobId, cancelling: false }));
         // 每 250ms 轮询宿主进度快照；小项目几秒就完成，粗轮询会只看到 0%。
+        // 连续 unknown / 请求失败说明任务已不在宿主里（主机重启等），置为 lost 解锁对话框，
+        // 不再让用户面对永远 0% 的孤儿进度条。
+        let unknownStreak = 0, errStreak = 0;
+        const markLost = () => {
+          setExportDialog(prev => prev && prev.status === 'running' ? { ...prev, status: 'done', error: '任务进度丢失（主机可能已重启）。已无正在运行的导出，请关闭后重新发起。' } : prev);
+        };
         const progTimer = setInterval(async () => {
           try {
             const p = await api('/ty/export/progress?jobId=' + jobId);
+            if (p && p.stage === 'unknown') { unknownStreak += 1; if (unknownStreak >= 20) { clearInterval(progTimer); markLost(); return; } }
+            else unknownStreak = 0;
+            errStreak = 0;
             setExportDialog(prev => prev && prev.status === 'running' ? { ...prev, progress: p } : prev);
-          } catch (_) {}
+          } catch (_) {
+            errStreak += 1;
+            if (errStreak >= 40) { clearInterval(progTimer); markLost(); }
+          }
         }, 250);
         try {
           const body = d.mode === 'auto'
@@ -5710,6 +5734,19 @@ window.__ModuleLoader__.load({
           clearInterval(progTimer);
           exportBusy.current = false;
           setExporting('');
+        }
+      };
+      // 终止任务：请求宿主杀掉该导出的全部子进程并停止处理剩余文件。
+      // 解锁由既有路径完成：自动导出 POST 返回 499（已取消）→ done 视图；
+      // 进度轮询也会看到 stage 'cancelled'。终止失败仅提示，不改变状态。
+      const cancelExport = async d => {
+        if (!d || d.status !== 'running' || !d.jobId || d.cancelling) return;
+        setExportDialog(prev => prev && prev.token === d.token ? { ...prev, cancelling: true } : prev);
+        try {
+          await api('/ty/export/cancel', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ jobId: d.jobId }) });
+        } catch (e) {
+          setExportDialog(prev => prev && prev.token === d.token ? { ...prev, cancelling: false } : prev);
+          toast('终止请求失败：' + String(e.message || e) + '。任务可能已结束。', 'danger');
         }
       };
       const closeExportDialog = () => { if (!exportBusy.current) setExportDialog(null); };
@@ -5989,9 +6026,10 @@ window.__ModuleLoader__.load({
               const hasTotal = Number.isFinite(p.total) && p.total > 0;
               const done = Math.min(p.done || 0, p.total || 0);
               const pct = hasTotal ? Math.round(done / p.total * 100) : null;
-              const stageMsg = p.stage === 'export' ? (p.msg || '正在调用 tycpv 导出…')
-                : hasTotal ? '正在整理第 ' + (done + 1) + ' / ' + p.total + ' 个工作簿' + (p.file ? '：' + p.file : '')
-                : '正在处理，请勿关闭页面…';
+              const stageMsg = p.stage === 'cancelled' ? (p.msg || '已取消，正在收尾…')
+                : p.stage === 'export' ? (p.msg || '正在调用 tycpv 导出…')
+                : hasTotal ? (p.msg || '正在整理第 ' + (done + 1) + ' / ' + p.total + ' 个工作簿' + (p.file ? '：' + p.file : ''))
+                : (p.msg || '正在处理，请勿关闭页面…');
               return h('div', { role: 'status', style: { margin: '12px 0' } },
                 h('p', { className: 'wb-hint', style: { marginBottom: 8 } }, stageMsg, ' · 已用时 ' + elapsed + ' 秒'),
                 h('div', { className: 'wb-bar' + (pct == null ? ' pulse' : '') }, h('i', { style: { width: (pct == null ? 30 : pct) + '%' } })),
@@ -6008,6 +6046,7 @@ window.__ModuleLoader__.load({
                 pathRow('源文件', file.sourcePath, false), pathRow('输出文件', file.outputPath, false), pathRow('对比报告', file.reportPath, false),
                 file.reason && h('div', { style: { color: 'var(--wb-danger-ink)', overflowWrap: 'anywhere', marginTop: 6 } }, file.reason)))))),
             h('div', { className: 'wb-form-foot' }, h(Btn, { onClick: closeExportDialog, disabled: d.status === 'running' }, d.status === 'confirm' ? '取消' : '关闭'),
+              d.status === 'running' && h(Btn, { variant: 'danger', disabled: d.cancelling, onClick: () => cancelExport(d) }, d.cancelling ? '正在终止…' : '终止任务'),
               d.status === 'confirm' && h(Btn, { variant: 'pri', disabled: !canRun, onClick: () => runTyExport(d) }, d.mode === 'auto' ? '确认导出并整理' : '确认整理')));
         })(),
         detail && h(Modal, { title: '天源项目详情', onClose: () => setDetail(null) },
