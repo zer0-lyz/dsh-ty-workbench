@@ -12,7 +12,7 @@ import { open, mkdir, readFile, rename, unlink } from 'node:fs/promises';
 import { randomBytes } from 'node:crypto';
 import { dirname, join } from 'node:path';
 import { homedir } from 'node:os';
-import { STATIC_DIRS, MGMT_FOLDER, MGMT_CATEGORIES, BASIC_CATEGORIES, INCOME_CHILDREN, abFoldersFor } from './folders.js';
+import { STATIC_DIRS, MGMT_FOLDER, MGMT_CATEGORIES, BASIC_CATEGORIES, INCOME_CHILDREN, abFoldersFor, abExtraFolders } from './folders.js';
 
 export const FOLDER_TEMPLATE_PATH = join(homedir(), '.tycpv', 'folder-template.json');
 export const MAX_FOLDER_TEMPLATE_BYTES = 256 * 1024;
@@ -115,10 +115,20 @@ function companyPaths(companies) {
     const whole = Array.isArray(m.whole) ? m.whole : [];
     const has = x => whole.indexOf(x) >= 0;
     if (has('资产基础法')) {
+      // 与天源系统同构：科目夹下固定「查证资料」，再按科目类型加 盘点/担保/科目通用文件/其他；
+      // 带明细（固定资产、无形资产）的科目在明细层各配 查证资料+其他。规则在 folders.js abExtraFolders。
       push(base + '03资产基础法/' + seg);
       abFoldersFor(c.subjects).forEach(def => {
-        push(base + '03资产基础法/' + seg + '/' + def.folder);
-        (def.children || []).forEach(ch => push(base + '03资产基础法/' + seg + '/' + def.folder + '/' + ch));
+        const subjBase = base + '03资产基础法/' + seg + '/' + def.folder;
+        push(subjBase);
+        push(subjBase + '/查证资料');
+        abExtraFolders(def.folder).forEach(x => push(subjBase + '/' + x));
+        (def.children || []).forEach(ch => {
+          const chBase = subjBase + '/' + ch;
+          push(chBase);
+          push(chBase + '/查证资料');
+          push(chBase + '/其他');
+        });
       });
     }
     if (has('收益法')) INCOME_CHILDREN.forEach(ch => push(base + '04收益法/' + seg + '/' + ch));

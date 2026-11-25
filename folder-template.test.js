@@ -45,8 +45,21 @@ test('公司段按方法与金额生成', () => {
   assert.ok(own.includes('02现场资料/企业提供资料/00财务资料/测试公司'));
   assert.ok(own.includes('02现场资料/企业提供资料/02基础类/测试公司/公司基础资料'));
   assert.ok(own.includes('02现场资料/企业提供资料/03资产基础法/测试公司/01货币资金'), '有金额科目应建目录');
+  assert.ok(own.includes('02现场资料/企业提供资料/03资产基础法/测试公司/01货币资金/查证资料'), '科目夹必有查证资料（天源同构）');
+  assert.ok(own.includes('02现场资料/企业提供资料/03资产基础法/测试公司/01货币资金/盘点'), '货币资金配盘点夹');
   assert.ok(!own.some(p => p.includes('03资产基础法/测试公司/12固定资产')), '金额为 0 的科目不应建目录');
   assert.ok(own.includes('02现场资料/企业提供资料/03资产基础法/测试公司/07存货'), '有金额的存货科目应建目录');
+  assert.ok(own.includes('02现场资料/企业提供资料/03资产基础法/测试公司/07存货/科目通用文件'), '存货配科目通用文件');
+  assert.ok(!own.some(p => p.includes('03资产基础法/测试公司/07存货/其他')), '存货不配其他');
+  // 固定资产带明细：明细层各配 查证资料+其他（对齐天源 房屋建筑物/车辆 等）
+  const plan2 = folderTemplatePlan(DEFAULT_FOLDER_TEMPLATE, [{
+    name: '测试公司',
+    methods: { whole: ['资产基础法'] },
+    subjects: [{ name: '固定资产', amount: 1 }],
+  }]);
+  const own2 = plan2.filter(p => p.includes('测试公司'));
+  assert.ok(own2.includes('02现场资料/企业提供资料/03资产基础法/测试公司/12固定资产/01房屋建筑物和构筑物/查证资料'), '明细配查证资料');
+  assert.ok(own2.includes('02现场资料/企业提供资料/03资产基础法/测试公司/12固定资产/01房屋建筑物和构筑物/其他'), '明细配其他');
   assert.ok(own.includes('02现场资料/企业提供资料/04收益法/测试公司/07折现率'));
   assert.ok(!own.some(p => p.includes('05市场法/测试公司')), '没选市场法不应建');
 });

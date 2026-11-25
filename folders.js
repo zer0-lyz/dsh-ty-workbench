@@ -157,6 +157,18 @@ export function abFoldersFor(subjects) {
   return hits;
 }
 
+// 资产基础法科目夹的天源同构子目录：每个科目必有「查证资料」，再按科目类型加专用夹
+// （与天源系统 get_project_file_list 实测结构一致：现金→盘点、借款→担保、存货→科目通用文件、
+//   权属/实物/税类→其他；带明细 children 的科目在明细层各配 查证资料+其他）。
+export function abExtraFolders(folder) {
+  const t = String(folder || '');
+  if (t === '01货币资金') return ['盘点'];
+  if (t === '07存货') return ['科目通用文件'];
+  if (t === '20短期借款' || t === '31长期借款') return ['担保'];
+  if (t === '11投资性房地产' || t === '13在建工程' || t === '18递延所得税资产' || t === '27应交税费') return ['其他'];
+  return [];
+}
+
 function safeSeg(name) {
   const t = String(name == null ? '' : name)
     .replace(/[\\/:*?"<>|\u0000-\u001f]/g, '_')
@@ -201,8 +213,16 @@ export function planProjectFolders(input) {
     if (has('资产基础法')) {
       push(base + '03资产基础法/' + seg);
       abFoldersFor(c.subjects).forEach(def => {
-        push(base + '03资产基础法/' + seg + '/' + def.folder);
-        (def.children || []).forEach(ch => push(base + '03资产基础法/' + seg + '/' + def.folder + '/' + ch));
+        const subjBase = base + '03资产基础法/' + seg + '/' + def.folder;
+        push(subjBase);
+        push(subjBase + '/查证资料');
+        abExtraFolders(def.folder).forEach(x => push(subjBase + '/' + x));
+        (def.children || []).forEach(ch => {
+          const chBase = subjBase + '/' + ch;
+          push(chBase);
+          push(chBase + '/查证资料');
+          push(chBase + '/其他');
+        });
       });
     }
     if (has('收益法')) {
@@ -215,4 +235,4 @@ export function planProjectFolders(input) {
   return out;
 }
 
-export default { STATIC_DIRS, INCOME_CHILDREN, AB_SUBJECTS, BASIC_CATEGORIES, MGMT_CATEGORIES, MGMT_FOLDER, amountOf, planProjectFolders, abFoldersFor, nonZeroSubjectNames };
+export default { STATIC_DIRS, INCOME_CHILDREN, AB_SUBJECTS, BASIC_CATEGORIES, MGMT_CATEGORIES, MGMT_FOLDER, amountOf, planProjectFolders, abFoldersFor, abExtraFolders, nonZeroSubjectNames };
