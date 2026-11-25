@@ -1434,3 +1434,58 @@ ego 的规则是：task space 被用户操作过就归用户，agent 不能自�
 
 **生效**：`client.js` 刷新页面即可；`index.js` 的 REV 现在是 `rev56`（改了宿主代码要重启 DSH）。
 
+
+## 合并防复发规则（2026-11-25，两次侧栏消失事故后制定）
+
+历史上「个人工作台」面板消失了两次，都是合并/并行改动踩了同一类坑。今后任何人（包括 AI 对话）合并或改动本插件，必须先核对下面的清单。
+
+### 铁律一：client factory id 必须等于包名
+
+`client.js` 开头 `window.__ModuleLoader__.load({ id: '...' })` 里的 id 必须与 `package.json` 的 `name`（`@zer0_y/dsh-ty-workbench`）完全一致。不一致时 ModuleLoader 找不到 factory，注入不执行，侧栏直接消失，且**没有任何报错**。
+
+- 同事 PR 的旧代码里出现过 `@local/dsh-ty-workbench`，合并时必须改回。
+- `scripts/check.mjs` 第 [6/6] 段会自动校验这一条，合并后必须跑 `node scripts/check.mjs` 且全绿才能推送/加载。
+
+### 铁律二：profile patch 只允许一个 workbench 条目
+
+`~/.dsh/profiles/desktop/cordis.patch.yml` 里，workbench 相关条目只允许存在一处：
+
+- **必须保留**顶层寻址条目（无 insert）：
+
+  ```yaml
+  - id: workbench
+    name: '@zer0_y/dsh-ty-workbench'
+    config:
+      enabled: true
+  ```
+
+  没有 它，`plugin_manager set_plugin` 报 `unaddressable`，热重载失效，面板改动无法生效。
+- **禁止**在 `- insert:` 块里再放 `id: workbench` 行。insert 行与插件自带 bundle patch 的 insert 重复，会使顶层 id patch 匹配歧义而被跳过（"Non-insert patches without a nonempty id… are warned and skipped"），这正是第二次面板消失的直接原因。
+- 改这个文件前先备份（`cp cordis.patch.yml /tmp/cordis.patch.yml.bakN`），改完用 node/python 校验语法，不要用脚本就地重写。
+
+### 铁律三：合并旧基线的 PR 时，逐块核对功能块是否被静默挤掉
+
+同事 fork 的基线往往比 main 旧。合并时即使无冲突标记，旧版 client.js 也可能把 rev58 这类新功能块（导出页脚 UI、声明正文 22 磅、逐公司导出循环等）整体替换掉。合并后必须：
+
+1. `grep -c` 抽查关键功能符号（如 footer 相关引用数、`/ty/export/` 路由数）与合并前对比；
+2. `node scripts/check.mjs` + `node --test` 全绿；
+3. 脱敏扫描 0 命中；
+4. 实际打开导出对话框、侧栏面板确认 UI 在。
+
+### 铁律四：合并后必做的验证链
+
+```
+node scripts/check.mjs        # 路由数 + factory id 一致性 + patch 包名一致性
+node --test                   # 全部测试通过
+热重载或重启 DSH               # set_plugin include:workbench false→true 须 applied
+确认侧栏【个人工作台】出现      # 面板加载回来才算合并完成
+```
+
+### 排障速查
+
+| 现象 | 先查 |
+| --- | --- |
+| 面板消失、无报错 | client.js 第 2 行 factory id ≠ 包名（铁律一） |
+| `set_plugin` 报 unaddressable | profile patch 顶层无 `- id: workbench` 条目，或 insert 块重复导致歧义（铁律二） |
+| 面板消失但 ping 401（后端活着） | 前端问题，按 README「面板空白自诊断」取 diag |
+| 热重载不生效 | 运行中宿主不重读 patch 层，需重启 DSH |
