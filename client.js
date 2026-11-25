@@ -4299,27 +4299,39 @@ window.__ModuleLoader__.load({
       useEffect(() => { load(); }, []);
       const dirty = () => JSON.stringify(tpl) !== JSON.stringify(saved);
       const edit = updater => {
-        setTpl(prev => {
-          const next = updater(JSON.parse(JSON.stringify(prev)));
-          if (onDirtyChange) onDirtyChange(JSON.stringify(next) !== JSON.stringify(saved));
-          return next;
-        });
+        // 不在 setTpl 的 updater 里调 onDirtyChange（那是在渲染阶段调父组件 setState，会告警/竞态）。
+        if (!tpl) return;
+        const next = updater(JSON.parse(JSON.stringify(tpl)));
+        setTpl(next);
+        if (onDirtyChange) onDirtyChange(JSON.stringify(next) !== JSON.stringify(saved));
       };
-      const mutateAt = (groups, path, fn) => {
-        // path 是 ['groups', i, 'children', j, …]；沿路定位节点后对它的 children 应用 fn
-        const idx = [];
-        for (let k = 1; k < path.length; k += 2) idx.push(path[k]);
-        let arr = groups;
-        for (let k = 0; k < idx.length - 1; k += 1) arr = arr[idx[k]].children;
-        const last = idx[idx.length - 1];
-        const node = idx.length > 1 ? arr[last] : null;
-        const target = idx.length > 1 ? node.children : arr;
-        fn(target);
-        return groups;
+      // path 形如 ['groups', i, 'children', j, …]，成对出现（键名, 下标）。直接定位节点本身，
+      // 避免「把 node.children 当 siblings 传给 mutator」这类错位；节点可能没有 children 键
+      // （内置默认的三级叶子是 { name } 裸节点），沿路顺手补空数组。
+      const nodeAt = (groups, path) => {
+        let node = null;
+        for (let k = 1; k < path.length; k += 2) {
+          const arr = k === 1 ? groups : (node ? (Array.isArray(node.children) ? node.children : (node.children = [])) : null);
+          if (!arr || !arr[path[k]]) return null;
+          node = arr[path[k]];
+        }
+        return node;
       };
-      const rename = (path, name) => edit(g => { mutateAt(g, path, list => { list[path[path.length - 1]].name = name; }); });
-      const remove = (path) => edit(g => { mutateAt(g, path, list => list.splice(path[path.length - 1], 1)); });
-      const addChild = (path) => edit(g => { mutateAt(g, path, list => { list[path[path.length - 1]].children = (list[path[path.length - 1]].children || []).concat([{ name: '新目录', children: [] }]); }); });
+      const siblingsAt = (groups, path) => {
+        if (path.length === 2) return groups;                       // 一级目录的兄弟就是 groups
+        const parent = nodeAt(groups, path.slice(0, -2));
+        if (!parent) return null;
+        if (!Array.isArray(parent.children)) parent.children = [];
+        return parent.children;
+      };
+      const rename = (path, name) => edit(g => { const n = nodeAt(g.groups, path); if (n) n.name = name; });
+      const remove = (path) => edit(g => { const sib = siblingsAt(g.groups, path); if (sib) sib.splice(path[path.length - 1], 1); });
+      const addChild = (path) => edit(g => {
+        const n = nodeAt(g.groups, path);
+        if (!n) return;
+        if (!Array.isArray(n.children)) n.children = [];
+        n.children.push({ name: '新目录', children: [] });
+      });
       const addTop = () => edit(g => { g.groups.push({ name: '新目录', children: [] }); });
       const save = async () => {
         setBusy(true);
