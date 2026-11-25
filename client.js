@@ -2594,6 +2594,23 @@ window.__ModuleLoader__.load({
     // 报表原件夹：客户给的各期报表放这里，「从「01财务报表」导入」就扫这个夹
     // （夹名与 folders.js 的 FIN_STATEMENT_DIR 必须一致）
     const financeStatementsFolderOf = company => financeFolderOf(company) + '/01财务报表';
+    // 扫描结果的汇总口径（认出几张报表 / 各有哪些年度）。
+    // AI 兜底把新认出的期并进来后要重算一次，否则卡片标题还写着旧的张数。
+    function fsScanSummary(packs, fileCount) {
+      const bal = []; const inc = [];
+      (packs || []).forEach(p => {
+        const y = Number(p.year);
+        if (!y) return;
+        const arr = p.statementType === 'income_statement' ? inc : bal;
+        if (arr.indexOf(y) < 0) arr.push(y);
+      });
+      return {
+        fileCount: Number(fileCount) || 0,
+        packCount: (packs || []).length,
+        balanceYears: bal.sort((a, b) => a - b),
+        incomeYears: inc.sort((a, b) => a - b),
+      };
+    }
     // 基础类资料：每家公司一套（02基础类/<公司>，里面再分 4 个分类）
     const basicFolderOf = company => '02现场资料/企业提供资料/02基础类/' + (segSafe(company) || '未命名公司');
 
@@ -3331,6 +3348,10 @@ window.__ModuleLoader__.load({
       const [scanKeep, setScanKeep] = useState({}); // 每期是否参与导入（默认全选）
       const [scanForce, setScanForce] = useState({}); // 人工指定的页分类 {文件名::页名: 'balance'|'income'|'skip'}
       const [batch, setBatch] = useState(null);     // 批量预检结果（待一次确认）
+      const [aiBusy, setAiBusy] = useState(false);  // AI 兜底解析进行中
+      const [aiNote, setAiNote] = useState(null);   // AI 兜底结果摘要 { ok, packs, errors }
+      const [aiModels, setAiModels] = useState([]); // 可用模型（读表能力差别大，让人自己选）
+      const [aiPick, setAiPick] = useState('');     // 'provider::model'
       const cur = lockId
         ? (rows.filter(r => r.id === lockId)[0] || null)
         : (rows.filter(r => r.id === who)[0] || rows[0] || null);
@@ -3368,7 +3389,7 @@ window.__ModuleLoader__.load({
       // 切到某家天源项目 → 拉它下面的公司
       const pickTyProject = async tyProjectId => {
         setTy(x => Object.assign({}, x, { companies: [] }));
-        setPending(null); setBatch(null);   // 换了天源项目，之前的确认 token 一律作废
+        setPending(null); setBatch(null); setAiNote(null);   // 换了天源项目，之前的确认 token 一律作废
         fsTop(project.id, cid, () => ({ tyProjectId: tyProjectId, tyCompanyId: '' }));
         if (!tyProjectId) return;
         try {
@@ -3451,6 +3472,7 @@ window.__ModuleLoader__.load({
         if (!cur) return;
         setBusy('scan');
         setBatch(null);
+        setAiNote(null);
         try {
           const r = await fetch(PREFIX + '/project/finance/scan', {
             method: 'POST', headers: { 'Content-Type': 'application/json' },
@@ -3493,6 +3515,77 @@ window.__ModuleLoader__.load({
         const next = Object.assign({}, scanForce, { [key]: val });
         setScanForce(next);
         scanFolder(next);
+      };
+      // 读表用哪个模型：宿主报的可用清单，默认第一个
+      const loadAiModels = async () => {
+        if ((aiModels || []).length) return aiModels;
+        try {
+          const r = await fetch(PREFIX + '/company/models');
+          const d = await r.json().catch(() => ({}));
+          const list = (d && Array.isArray(d.providers) ? d.providers : []).flatMap(p =>
+            (p.models || []).map(m => ({ provider: p.id, model: m.id, label: (p.name || p.id) + ' / ' + (m.name || m.id) })));
+          setAiModels(list);
+          if (list.length && !aiPick) setAiPick(list[0].provider + '::' + list[0].model);
+          return list;
+        } catch (e) { return []; }
+      };
+      useEffect(() => { if (scan || aiBusy) loadAiModels(); }, [scan, aiBusy]);
+
+      // AI 兜底：规则认不出的页，把单元格丢给模型读一遍。
+      // 只读用户点名的那些页（needManual 里还没指定分类的），不做全目录 AI 扫描。
+      const aiParse = async () => {
+        if (!cur) return;
+        const targets = ((scan && scan.needManual) || [])
+          .filter(m => !forceOf(m.fileName + '::' + m.sheet).kind)
+          .map(m => ({ fileName: m.fileName, sheet: m.sheet }));
+        if (!targets.length) { toast('没有需要 AI 读的页（都指定过分类了）', 'warn'); return; }
+        setAiBusy(true);
+        setAiNote(null);
+        try {
+          const r = await fetch(PREFIX + '/project/finance/ai-parse', {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              folder: folderNameOf(project), abs: projectAbs(project),
+              company: cur.name, basedate: baseDate || '', targets,
+              provider: (aiPick || '').split('::')[0] || '',
+              model: (aiPick || '').split('::')[1] || '',
+            }),
+          });
+          if (r.status === 404) throw new Error('宿主未重载，重启 DSH 后可用');
+          const d = await r.json().catch(() => ({}));
+          if (!r.ok || !d.ok) throw new Error((d && d.error) || ('HTTP ' + r.status));
+          const got = d.packs || [];
+          const errs = d.errors || [];
+          setAiNote({ ok: got.length, errors: errs });
+          if (got.length) {
+            // AI 读出来的期直接并进扫描结果，跟规则认出的期一样走勾选 → 预检 → 一次确认
+            setScan(prev => {
+              if (!prev) return prev;
+              const done = {};
+              got.forEach(p => { done[p.fileName + '::' + p.sheet] = true; });
+              const packs = (prev.packs || []).slice();
+              got.forEach(p => {
+                const i = packs.findIndex(x => x.statementType === p.statementType && Number(x.year) === Number(p.year));
+                if (i >= 0) packs[i] = p; else packs.push(p);
+              });
+              return Object.assign({}, prev, {
+                packs,
+                summary: fsScanSummary(packs, (prev.summary || {}).fileCount || (prev.files || []).length),
+                needManual: (prev.needManual || []).filter(m => !done[m.fileName + '::' + m.sheet]),
+              });
+            });
+            setScanKeep(prev => {
+              const keep = Object.assign({}, prev);
+              got.forEach(p => { const k = p.statementType + '@' + p.year; if (keep[k] === undefined) keep[k] = true; });
+              return keep;
+            });
+          }
+          toast(got.length
+            ? ('AI 读出 ' + got.length + ' 张报表' + (errs.length ? '，' + errs.length + ' 页仍失败' : ''))
+            : ('AI 也没读出来' + (errs.length ? '：' + errs[0].error : '')), got.length ? 'info' : 'warn');
+        } catch (e) {
+          toast('AI 解析失败：' + String((e && e.message) || e), 'warn');
+        } finally { setAiBusy(false); }
       };
       // 批量预检：按报表类型分组，每种类型一次 prepare（sheetList 里放该类型的所有年度）
       const prepareBatch = async () => {
@@ -3874,6 +3967,48 @@ window.__ModuleLoader__.load({
             h('thead', null, h('tr', null, ['文件', '页签', '情况', '指定为'].map((t, i) => h('th', { key: i }, t)))),
             h('tbody', null, scan.needManual.map(manualRow))))
         : null;
+      // AI 兜底按钮：只处理 needManual 里还没指定分类的页
+      const aiTargets = ((scan && scan.needManual) || []).filter(m => !forceOf(m.fileName + '::' + m.sheet).kind);
+      const aiBox = (aiBusy || aiTargets.length || (aiNote && ((aiNote.errors || []).length || aiNote.ok)))
+        ? h('div', { className: 'pf-card', style: { marginTop: 8 } },
+          h('p', null, h('b', null, 'AI 兜底解析'),
+            h('span', { className: 'pf-hint', style: { marginLeft: 8 } },
+              '规则认不出的页，让模型按业务常识把科目和金额读出来（读出的期会并到下面的勾选表里）')),
+          aiTargets.length
+            ? h('p', { className: 'pf-hint' }, '待 AI 读 ' + aiTargets.length + ' 页：'
+              + aiTargets.slice(0, 6).map(m => m.fileName + ' / ' + m.sheet).join('；')
+              + (aiTargets.length > 6 ? ' 等' : ''))
+            : null,
+          (aiNote && (aiNote.errors || []).length)
+            ? h('p', { className: 'pf-hint' }, '仍失败 ' + aiNote.errors.length + ' 页：'
+              + aiNote.errors.slice(0, 4).map(e => e.fileName + ' / ' + e.sheet + '：' + e.error).join('；'))
+            : null,
+          h('div', { className: 'pw-acts', style: { marginTop: 6, flexWrap: 'wrap' } },
+            h('label', { className: 'pf-hint', style: { marginRight: 6 } }, '读表模型',
+              h('select', {
+                className: 'pf-sel', style: { marginLeft: 4, maxWidth: 260 },
+                value: aiPick,
+                onChange: e => setAiPick(e.target.value),
+              }, (aiModels || []).length
+                ? aiModels.map(o => h('option', { key: o.provider + '::' + o.model, value: o.provider + '::' + o.model }, o.label))
+                : [h('option', { key: 'none', value: '' }, '（宿主没报可用模型）')])),
+            h('button', {
+              type: 'button', className: 'pf-btn pri',
+              disabled: aiBusy || !aiTargets.length,
+              onClick: aiParse,
+            }, aiBusy ? 'AI 读表中…（一页可能要十几秒）' : '让 AI 读这些页'),
+            h('button', {
+              type: 'button', className: 'pf-btn',
+              disabled: aiBusy || !aiTargets.length,
+              onClick: () => {
+                // 不想用 AI 也可以直接跳过：把这些页标记为 skip 后重扫，needManual 就清空了
+                let next = scanForce;
+                aiTargets.forEach(m => { next = Object.assign({}, next, { [m.fileName + '::' + m.sheet]: 'skip' }); });
+                setScanForce(next);
+                scanFolder(next);
+              },
+            }, '这几页直接跳过')))
+        : null;
       // 认出来的报表：勾选要导入的期
       const packRow = (p, i) => {
         const k = p.statementType + '@' + p.year;
@@ -3905,6 +4040,7 @@ window.__ModuleLoader__.load({
           h('p', null, h('b', null, '「01财务报表」里扫到 ' + (scan.files || []).length + ' 个文件、' + (scan.packs || []).length + ' 张报表')),
           h('p', { className: 'pf-hint' }, '目录：' + (scan.rel || '') + '（点下面「打开报表文件夹」把各期报表放进去，再点「重新扫描」）'),
           needManualBox,
+          aiBox,
           packBox,
           conflictBox,
           h('div', { className: 'pw-acts', style: { marginTop: 6 } },
@@ -3959,12 +4095,12 @@ window.__ModuleLoader__.load({
           h('div', { className: 'pw-filters' },
             lockId
               ? h('label', null, '公司', h('span', { className: 'pf-hint' }, cid ? (cur.code + ' ' + cur.name) : '—'))
-              : h('label', null, '公司', h('select', { className: 'pf-sel', value: cid, onChange: e => { setWho(e.target.value); setScan(null); setBatch(null); } }, rows.map(r => h('option', { key: r.id, value: r.id }, r.code + ' ' + r.name)))),
+              : h('label', null, '公司', h('select', { className: 'pf-sel', value: cid, onChange: e => { setWho(e.target.value); setScan(null); setBatch(null); setAiNote(null); } }, rows.map(r => h('option', { key: r.id, value: r.id }, r.code + ' ' + r.name)))),
             h('button', { type: 'button', className: 'pf-btn', disabled: busy === 'import', onClick: () => fileRef.current && fileRef.current.click() }, busy === 'import' ? '读取中…' : '导入科目余额表'),
             h('button', { type: 'button', className: 'pf-btn', title: '从绑定的天源项目拉这家公司资产基础法的非零科目（金额以天源为准，本地独有的科目保留）', disabled: busy === 'sync', onClick: syncTy }, busy === 'sync' ? '同步中…' : '从天源同步科目'),
             h('button', { type: 'button', className: 'pf-btn', title: '把天源这家公司「资产基础法/*/查证资料（含盘点/担保/科目通用文件/其他）」的文件下载到本地对应科目夹', disabled: busy === 'pull', onClick: pullFiles }, busy === 'pull' ? '拉取中…' : '拉查证资料'),
             h('button', { type: 'button', className: 'pf-btn', onClick: clearAll }, '清空')),
-            h('label', null, '报表口径', h('select', { className: 'pf-sel', value: mode, onChange: e => { setMode(e.target.value); setPending(null); setResult(null); setBatch(null); } },
+            h('label', null, '报表口径', h('select', { className: 'pf-sel', value: mode, onChange: e => { setMode(e.target.value); setPending(null); setResult(null); setBatch(null); setAiNote(null); } },
               h('option', { value: '1' }, '单体'), h('option', { value: '2' }, '合并')),
             h('label', { title: baseDate ? ('从评估基准日 ' + baseDate + ' 所在年度往前推') : '项目里还没填评估基准日' }, '报表显示期数',
               h('select', { className: 'pf-sel', value: String(nPeriods), onChange: e => setPeriods(e.target.value) },
@@ -3993,7 +4129,7 @@ window.__ModuleLoader__.load({
               h('option', { value: '' }, ty.status === 'on' ? '选择天源项目' : (ty.status === 'loading' ? '连接中…' : '天源未连接')),
               tyOpts),
             h('span', { className: 'pf-hint' }, '公司 '),
-            h('select', { className: 'pf-sel', style: { maxWidth: 260 }, value: String(box.tyCompanyId || ''), onChange: e => { fsTop(project.id, cur.id, () => ({ tyCompanyId: e.target.value })); setPending(null); setBatch(null); } },
+            h('select', { className: 'pf-sel', style: { maxWidth: 260 }, value: String(box.tyCompanyId || ''), onChange: e => { fsTop(project.id, cur.id, () => ({ tyCompanyId: e.target.value })); setPending(null); setBatch(null); setAiNote(null); } },
               h('option', { value: '' }, '选择天源公司'), tyCOpts))),
         // ── 页签：资产负债表 / 利润表
         h('div', { className: 'pw-tabs' },
@@ -5321,7 +5457,7 @@ window.__ModuleLoader__.load({
     // 目录树的可视化管理：增删改任意层级目录，保存后 /project/folders/build 就按它建骨架。
     // 数据契约见 folder-template.js：{ version:1, groups:[{ name, children:[…] }] }，层级≤5、目录≤400。
     function FolderTemplatePage({ toast, onDirtyChange, tpl: tplProp, setTpl, saved: savedProp, setSaved, ui, setUi }) {
-      const REV = 'r20261125-2300';   // 版本标记：显示在页头，用于确认面板加载的是哪一代 client.js
+      const REV = 'r20261126-0020';   // 版本标记：显示在页头，用于确认面板加载的是哪一代 client.js
       // 状态全部提升到 WorkbenchPage（宿主 shim 对子组件 setState 重渲染不可靠，见 WorkbenchPage 注释）。
       // 这里 tpl/saved/ui 只是 prop 的短别名；loadLoading 放在模块级闭包外的可变槽（组件重挂也不重复请求）。
       const tpl = tplProp; const saved = savedProp;
@@ -5329,7 +5465,8 @@ window.__ModuleLoader__.load({
       const busy = !!(ui && ui.busy);
       const loadError = (ui && ui.loadError) || null;
       const confirmDel = (ui && ui.confirmDel) || '';
-      const patchUi = p => setUi(Object.assign({}, ui, p));
+      // 函数式更新拿最新 prev 合并——patchUi 若用渲染闭包里的 ui，同一周期连发两次会丢前一次字段。
+      const patchUi = p => setUi(prev => Object.assign({}, prev, p));
       let loadLoading = FolderTemplatePage.__loading === true;
       const load = async () => {
         if (loadLoading) return;
