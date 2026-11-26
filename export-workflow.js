@@ -15,8 +15,20 @@ const restoreScript = 'asset-link-restore/scripts/restore_links.py';
 const inside = (root, p) => { const r = relative(root, p); return r === '' || (!isAbsolute(r) && r !== '..' && !r.startsWith('..' + sep)); };
 const errorText = e => String(e?.stderr || e?.message || e).trim().slice(-3000);
 
-async function run(bin, args) {
-  await exec(bin, args, { timeout: 300000, maxBuffer: 4 * 1024 * 1024, windowsHide: true });
+async function run(bin, args, onSpawn, cancel) {
+  const child = exec(bin, args, { timeout: 300000, maxBuffer: 4 * 1024 * 1024, windowsHide: true });
+  if (typeof onSpawn === 'function') { try { onSpawn(child); } catch { /* 注册失败不影响运行 */ } }
+  try {
+    await child;
+  } catch (e) {
+    // 子进程被「终止任务」杀掉时，把底层 kill 报错替换成语义明确的「导出已取消」。
+    if (typeof cancel === 'function' && cancel()) {
+      const err = new Error('导出已取消');
+      err.cancelled = true;
+      throw err;
+    }
+    throw e;
+  }
 }
 async function exists(p) { try { await access(p); return true; } catch { return false; } }
 async function scriptsFor(restore, format, kind) {
@@ -73,13 +85,15 @@ async function copySource(src, dest) {
  */
 export async function runManualWorkflow(options) {
   if (!options || typeof options !== 'object' || Array.isArray(options)) throw new TypeError('options 必须是对象');
-  const allowed = new Set(['sourcePath', 'outputDir', 'kind', 'restoreFormulas', 'applyFormat', 'onProgress']);
+  const allowed = new Set(['sourcePath', 'outputDir', 'kind', 'restoreFormulas', 'applyFormat', 'onProgress', 'cancel', 'onSpawn']);
   for (const key of Object.keys(options)) if (!allowed.has(key)) throw new TypeError('不支持的参数：' + key);
   const { sourcePath, outputDir, kind } = options;
   if (typeof sourcePath !== 'string' || !isAbsolute(sourcePath) || typeof outputDir !== 'string' || !isAbsolute(outputDir)) throw new TypeError('sourcePath 和 outputDir 必须是绝对路径');
   if (!Object.hasOwn(formats, kind)) throw new TypeError('kind 必须是 detail 或 declare');
   for (const key of ['restoreFormulas', 'applyFormat']) if (options[key] !== undefined && typeof options[key] !== 'boolean') throw new TypeError(key + ' 必须是布尔值');
   if (options.onProgress !== undefined && typeof options.onProgress !== 'function') throw new TypeError('onProgress 必须是函数');
+  if (options.cancel !== undefined && typeof options.cancel !== 'function') throw new TypeError('cancel 必须是函数');
+  if (options.onSpawn !== undefined && typeof options.onSpawn !== 'function') throw new TypeError('onSpawn 必须是函数');
   const restore = options.restoreFormulas === true, format = options.applyFormat === true;
   if (kind === 'declare' && (restore || !format)) throw new TypeError('申报表只允许 applyFormat');
   if (!restore && !format) throw new TypeError('至少选择一项处理');
@@ -98,8 +112,11 @@ export async function runManualWorkflow(options) {
   const py = process.env.WORKBENCH_PYTHON || (await exists(venvPython) ? venvPython : 'python3');
   const outDir = await mkdtemp(join(outReal, 'manual-workflow-'));
   const onProgress = typeof options.onProgress === 'function' ? options.onProgress : null;
+  const cancel = typeof options.cancel === 'function' ? options.cancel : null;
+  const onSpawn = typeof options.onSpawn === 'function' ? options.onSpawn : null;
   const results = [];
   for (const [fi, src] of files.entries()) {
+    if (cancel && cancel()) throw new Error('导出已取消');
     if (onProgress) { try { onProgress({ done: fi, total: files.length, file: basename(src), msg: '正在整理：' + basename(src) }); } catch { /* 进度回调失败不影响处理 */ } }
     let temp, reportPath = null, outputPath = null;
     const stages = [];
@@ -113,7 +130,8 @@ export async function runManualWorkflow(options) {
       if (!inside(root, await realpath(src))) throw new Error('源路径已越过选定目录');
       await copySource(src, stage);
       if (restore) {
-        await run(py, [join(skills, restoreScript), stage]);
+        await run(py, [join(skills, restoreScript), stage], onSpawn, cancel);
+        if (cancel && cancel()) throw new Error('导出已取消');
         const generated = join(temp, stem + '_链接恢复' + ext);
         if (!(await exists(generated))) throw new Error('恢复公式没有产出工作簿');
         // Use the generated file directly; do not replace any existing file.
@@ -124,9 +142,10 @@ export async function runManualWorkflow(options) {
       if (format) {
         const fmtArgs = [join(skills, formats[kind]), stage, '--no-backup'];
         if (kind === 'declare') fmtArgs.push('--skip-fill');
-        await run(py, fmtArgs); stages.push('apply_format');
+        await run(py, fmtArgs, onSpawn, cancel); stages.push('apply_format');
+        if (cancel && cancel()) throw new Error('导出已取消');
       }
-      const verify = async p => run(py, ['-c', 'import sys,zipfile; sys.exit(0 if zipfile.ZipFile(sys.argv[1]).testzip() is None else 2)', p]);
+      const verify = async p => run(py, ['-c', 'import sys,zipfile; sys.exit(0 if zipfile.ZipFile(sys.argv[1]).testzip() is None else 2)', p], onSpawn, cancel);
       await verify(stage);
       const report = join(temp, stem + '_链接恢复对比报告.xlsx');
       const hasReport = restore && await exists(report);

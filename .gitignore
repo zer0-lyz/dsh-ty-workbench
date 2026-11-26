@@ -23,3 +23,4 @@ venv/
 
 # DSH 本机标记
 workbench-host-applied.json
+node_modules

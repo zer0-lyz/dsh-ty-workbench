@@ -45,9 +45,16 @@ def _copy_row_style(ws, from_row, to_row, max_col):
 
 
 def _cellmap(ws):
-    """Non-empty values keyed by (row, col); formulas kept as strings."""
+    """Non-empty values keyed by (row, col); formulas kept as strings.
+
+    Empty strings are normalized away: LibreOffice drops them on xlsx
+    round-trip while openpyxl keeps them, so counting them as values causes
+    a spurious 'bridge layout diverged' rejection that rolls back the batch.
+    An empty string carries no content, so treating it as absent is safe.
+    """
     return {(c.row, c.column): c.value
-            for row in ws.iter_rows() for c in row if c.value is not None}
+            for row in ws.iter_rows() for c in row
+            if c.value is not None and c.value != ''}
 
 
 def _norm(v):
@@ -86,6 +93,44 @@ def _validate_ops(src, ops):
         seen.add(sheet)
 
 
+def _shift_area(area, sheet, row, count, operation):
+    """Shift a print-area range for a row insert/delete, keeping it inside bounds.
+
+    LibreOffice's xlsx round-trip drops print areas entirely, so the bridge
+    output cannot be used as ground truth for them. We shift them ourselves.
+    """
+    if not area:
+        return area
+    ref = str(area).split('!')[-1].replace('$', '').replace("'", '')
+    if ':' not in ref:
+        return area
+    from openpyxl.utils.cell import range_boundaries, get_column_letter
+    try:
+        c1, r1, c2, r2 = range_boundaries(ref)
+    except Exception:
+        return area
+    def sh(r):
+        if operation == 'insert':
+            return r + count if r >= row else r
+        if r >= row + count:
+            return r - count
+        if row <= r < row + count:
+            return None
+        return r
+    nr1, nr2 = sh(r1), sh(r2)
+    if nr1 is None:
+        if nr2 is None:
+            return None  # whole print area deleted
+        nr1 = nr2
+    if nr2 is None:
+        nr2 = nr1
+    nr1, nr2 = max(1, nr1), max(1, nr2)
+    if nr1 > nr2:
+        return None
+    shifted = f'{get_column_letter(c1)}{nr1}:{get_column_letter(c2)}{nr2}'
+    return f"'{sheet}'!{shifted}" if sheet else shifted
+
+
 def apply_operations(source_path, bridge_out_path, target_path, ops):
     """Apply a list of single-sheet ops with the bridge output as ground truth."""
     if target_path == source_path:
@@ -98,6 +143,9 @@ def apply_operations(source_path, bridge_out_path, target_path, ops):
         raise SystemExit('sheet set mismatch between source and bridge output')
     _validate_ops(src, ops)
     changed = {op['sheet'] for op in ops}
+    # LibreOffice drops print areas on save -> capture them from the authoritative
+    # source before any structural shift, then reapply (shifted) at the end.
+    orig_areas = {name: src[name].print_area for name in src.sheetnames}
 
     # 1) structural shifts on the openpyxl copy (styles move with rows)
     for op in ops:
@@ -133,8 +181,11 @@ def apply_operations(source_path, bridge_out_path, target_path, ops):
             ws.cell(r, c).value = v
         total_formulas += len(lo_formulas)
 
-    # 4) merges and print areas: changed sheets take bridge values verbatim;
-    #    untouched sheets must match strictly (normalized comparison).
+    # 4) merges: changed sheets take bridge values verbatim; untouched sheets
+    #    must match strictly. Print areas are handled separately: LibreOffice
+    #    drops them on save, so we shift them ourselves for changed sheets and
+    #    preserve them verbatim for untouched sheets.
+    op_by_sheet = {o['sheet']: o for o in ops}
     total_merges = 0
     for name in src.sheetnames:
         ws, lo_ws = src[name], lo[name]
@@ -148,13 +199,16 @@ def apply_operations(source_path, bridge_out_path, target_path, ops):
                     ws.merged_cells.ranges.remove(m)
                 for m in sorted(want):
                     ws.merge_cells(m)
-            ws.print_area = lo_ws.print_area
+            op = op_by_sheet[name]
+            old_area = orig_areas.get(name)
+            if old_area:
+                ws.print_area = _shift_area(old_area, name, int(op['row']),
+                                            int(op['count']), op['operation']) or ''
             total_merges += len(want)
         else:
             if have != want:
                 raise SystemExit('bridge output diverged on untouched sheet merges: ' + name)
-            if _norm_area(ws.print_area) != _norm_area(lo_ws.print_area):
-                raise SystemExit('bridge output diverged on untouched sheet print area: ' + name)
+            # 打印区不比对桥输出：LibreOffice 会清空打印区；原样保留即可。
 
     # 5) untouched sheets: non-formula values must match the source strictly
     #    (formula cells were reconciled above; type mismatches are divergence).

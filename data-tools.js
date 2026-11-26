@@ -19,7 +19,7 @@ import { openShell } from './opener.js';
  * 不用 404 假装能用。
  */
 
-const DT_REV = 'rev22';
+const DT_REV = 'rev24';
 
 function json(data, status) {
   const body = JSON.stringify(data === undefined ? null : data);
@@ -220,7 +220,10 @@ function finishTask(task, status, payload) {
   task.percent = status === 'done' ? 100 : Math.max(0, Number(payload && payload.percent) || task.percent || 0);
   task.message = (payload && (payload.message || payload.reason)) || task.message;
   task.error = status === 'failed' ? String((payload && (payload.reason || payload.error)) || task.error || '任务失败') : '';
-  task.result = payload || null;
+  // 客户端按扁平字段读取结果（res.excelPath / res.results / res.workbook_path …）；
+  // 后端习惯把业务结果挂在 payload.result 里，这里摊平到顶层，避免结果按钮全部消失。
+  const inner = payload && payload.result && typeof payload.result === 'object' ? payload.result : null;
+  task.result = inner ? { ...payload, ...inner } : (payload || null);
   task.finishedAt = new Date().toISOString();
 }
 
@@ -352,10 +355,29 @@ function listHistory(dir) {
   if (!abs || !isAbsolute(abs) || !existsSync(abs) || !statSync(abs).isDirectory()) {
     return { ok: false, error: '历史目录无效或不存在：' + (abs || '(空)') };
   }
+  // 成果（含 *_history.json）统一存放在输出目录下的查询子文件夹中，顶层保持平铺兼容旧产物。
+  const entries = [{ dir: abs, depth: 0 }];
+  const seen = new Set([abs]);
+  const historyFiles = [];
+  while (entries.length) {
+    const { dir: cur, depth } = entries.shift();
+    let names = [];
+    try { names = readdirSync(cur); } catch (e) { continue; }
+    for (const name of names) {
+      if (name.startsWith('.')) continue;
+      const full = join(cur, name);
+      let st;
+      try { st = statSync(full); } catch (e) { continue; }
+      if (st.isDirectory()) {
+        if (depth < 2 && !seen.has(full)) { seen.add(full); entries.push({ dir: full, depth: depth + 1 }); }
+      } else if (/_history\.json$/i.test(name)) {
+        historyFiles.push(full);
+      }
+    }
+  }
   const items = [];
-  for (const name of readdirSync(abs)) {
-    if (!/_history\.json$/i.test(name)) continue;
-    const full = join(abs, name);
+  for (const full of historyFiles) {
+    const name = basename(full);
     let recordCount = 0;
     let label = name.replace(/_history\.json$/i, '');
     try {
@@ -479,7 +501,8 @@ function landRun(body) {
       mapPath: finalPayload.mapPath || '',
       coordsPath: finalPayload.coordsPath || '',
       historyPath: finalPayload.historyPath || '',
-      outputDirectory: request.outputDirectory,
+      // 成果已进入查询子文件夹，「打开输出目录」直接打开子目录而不是外层
+      outputDirectory: finalPayload.excelPath ? dirname(finalPayload.excelPath) : request.outputDirectory,
       results: Array.isArray(finalPayload.results) ? finalPayload.results : [],
       fetchedCount: finalPayload.fetchedCount,
       filteredCount: finalPayload.filteredCount,

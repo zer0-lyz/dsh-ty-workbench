@@ -31,7 +31,7 @@ const fail = (msg) => { failed++; console.error('  ✗ ' + msg); };
 const ok = (msg) => console.log('  ✓ ' + msg);
 
 // ───────────────────────── 1. import ─────────────────────────
-console.log('[1/5] 模块导入');
+console.log('[1/6] 模块导入');
 let mod;
 try {
   mod = await import(join(ROOT, 'index.js'));
@@ -94,7 +94,7 @@ delete globalThis.__dshWorkbenchRouteOwners;
 globalThis.__dshWorkbenchRouteOwners = new Map();
 
 // ───────────────────────── 3. 跑 apply() ─────────────────────────
-console.log('[2/5] apply() 执行');
+console.log('[2/6] apply() 执行');
 try {
   mod.apply(ctx);
   ok('apply() 未抛异常');
@@ -107,7 +107,7 @@ try {
 }
 
 // ───────────────────────── 4. effect 覆盖 ─────────────────────────
-console.log('[3/5] effect 段落');
+console.log('[3/6] effect 段落');
 const labels = effects.map(e => e.label);
 for (const want of ['workbench: API routes', 'workbench: agent tools', 'workbench: bundled skill registration']) {
   if (labels.includes(want)) ok(want);
@@ -115,7 +115,7 @@ for (const want of ['workbench: API routes', 'workbench: agent tools', 'workbenc
 }
 
 // ───────────────────────── 5. 路由数 ─────────────────────────
-console.log('[4/5] 路由注册');
+console.log('[4/6] 路由注册');
 const routeCount = registered.filter(r => typeof r.path === 'string' && r.path.startsWith('/api/workbench')).length;
 if (routeCount > 0) ok('已注册 ' + routeCount + ' 条 /api/workbench/* 路由');
 else fail('一条 /api/workbench/* 路由都没注册上');
@@ -137,7 +137,7 @@ if (missing.length === 0) ok('导出链路关键路由齐全（' + critical.leng
 else fail('缺少关键路由：\n      ' + missing.join('\n      '));
 
 // ───────────────────────── 6. 内置技能 ─────────────────────────
-console.log('[5/5] 内置技能');
+console.log('[5/6] 内置技能');
 if (skillRegs.length === 0) {
   fail('内置技能未注册（skills 服务缺失或 SKILL.md 读不到）');
 } else {
@@ -154,6 +154,39 @@ try {
   else ok('SKILL.md frontmatter 完整');
 } catch (e) {
   fail('skills/tianyuan-query/SKILL.md 读取失败：' + e.message);
+}
+
+// ───────────── 包名与 client factory id 一致性 ─────────────
+// 踩过两次的坑（b0bce42 / 609c425）：宿主 dsh-client-modules 的
+// locatePkgJson → nearestPackage 要求 Loader 引用的名字与真实 package.json
+// 的 name 逐字相等，否则 resolveMeta 返回 null，client bundle 被静默丢弃，
+// 侧栏入口整个不出现，而宿主路由照旧注册、接口全正常——极难定位。
+// 这里把「package.json name / client.js factory id / 自带 cordis.patch.yml」
+// 三处锁死，任一处漂移就在自检阶段报出来。
+console.log('[6/6] 包名与 client factory id');
+try {
+  const pkg = JSON.parse(readFileSync(join(ROOT, 'package.json'), 'utf8'));
+  const pkgName = pkg.name;
+  if (typeof pkgName !== 'string' || !pkgName) fail('package.json 缺 name');
+
+  const firstClientLines = readFileSync(join(ROOT, 'client.js'), 'utf8').split('\n', 4).join('\n');
+  const idMatch = /id:\s*'([^']+)'/.exec(firstClientLines);
+  if (!idMatch) fail('client.js 前几行找不到 factory id');
+  else if (idMatch[1] !== pkgName) fail('client.js factory id「' + idMatch[1] + '」≠ package.json name「' + pkgName + '」');
+  else ok('client.js factory id 与包名一致：' + pkgName);
+
+  const patchText = readFileSync(join(ROOT, 'cordis.patch.yml'), 'utf8');
+  const patchNames = [...patchText.matchAll(/^\s*-?\s*name:\s*'?([^'\n]+)'?\s*$/gm)].map(m => m[1].trim());
+  const stray = patchNames.filter(n => n !== pkgName);
+  if (stray.length) fail('cordis.patch.yml 引用了非本包名：' + stray.join('、'));
+  else ok('cordis.patch.yml 引用的包名一致');
+
+  // exports 必须提供 "./client"，否则宿主读不到 client bundle
+  const exportsDecl = pkg.exports || {};
+  if (exportsDecl['./client'] !== './client.js') fail('package.json exports 缺少 "./client": "./client.js"');
+  else ok('exports ./client 指向 client.js');
+} catch (e) {
+  fail('包名一致性校验异常：' + e.message);
 }
 
 // ───────────────────────── 汇总 ─────────────────────────

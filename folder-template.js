@@ -12,7 +12,7 @@ import { open, mkdir, readFile, rename, unlink } from 'node:fs/promises';
 import { randomBytes } from 'node:crypto';
 import { dirname, join } from 'node:path';
 import { homedir } from 'node:os';
-import { STATIC_DIRS, MGMT_FOLDER, MGMT_CATEGORIES, BASIC_CATEGORIES, INCOME_CHILDREN, AB_SUBJECTS, abFoldersFor, abExtraFolders, FIN_STATEMENT_DIR, AUDIT_REPORT_DIR } from './folders.js';
+import { STATIC_DIRS, MGMT_FOLDER, MGMT_CATEGORIES, BASIC_CATEGORIES, INCOME_CHILDREN, AB_SUBJECTS, abFoldersFor, abExtraFolders, FIN_STATEMENT_DIR, AUDIT_REPORT_DIR, TB_DIR, AUX_DIR, GL_DIR } from './folders.js';
 
 export const FOLDER_TEMPLATE_PATH = join(homedir(), '.tycpv', 'folder-template.json');
 export const MAX_FOLDER_TEMPLATE_BYTES = 256 * 1024;
@@ -39,7 +39,7 @@ function defaultTreeFromPaths() {
   // 生成项目时按公司勾选的方法/科目从这个全集里过滤加载，不在此处动态拼）。
   ['00财务资料', '02基础类', '03资产基础法', '04收益法', '05市场法'].forEach(seg => {
     ensure(['02现场资料', '企业提供资料', seg]);
-    if (seg === '00财务资料') [FIN_STATEMENT_DIR, AUDIT_REPORT_DIR].forEach(d => ensure(['02现场资料', '企业提供资料', seg, d]));
+    if (seg === '00财务资料') [FIN_STATEMENT_DIR, AUDIT_REPORT_DIR, TB_DIR, AUX_DIR, GL_DIR].forEach(d => ensure(['02现场资料', '企业提供资料', seg, d]));
     if (seg === '02基础类') BASIC_CATEGORIES.forEach(cat => ensure(['02现场资料', '企业提供资料', seg, cat]));
     if (seg === '04收益法') INCOME_CHILDREN.forEach(ch => ensure(['02现场资料', '企业提供资料', seg, ch]));
     if (seg === '03资产基础法') AB_SUBJECTS.forEach(def => {
@@ -154,6 +154,9 @@ function companyPaths(companies, template) {
     // 报表原件夹（公司级固定一层）：客户给的各期报表放这里，「导入报表」扫这个夹
     push(base + '00财务资料/' + seg + '/' + FIN_STATEMENT_DIR);
     push(base + '00财务资料/' + seg + '/' + AUDIT_REPORT_DIR);
+    push(base + '00财务资料/' + seg + '/' + TB_DIR);
+    push(base + '00财务资料/' + seg + '/' + AUX_DIR);
+    push(base + '00财务资料/' + seg + '/' + GL_DIR);
     push(base + '02基础类/' + seg);
     BASIC_CATEGORIES.forEach(cat => push(base + '02基础类/' + seg + '/' + cat));
     const m = (c && c.methods) || {};

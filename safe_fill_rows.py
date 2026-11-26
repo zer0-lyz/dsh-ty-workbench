@@ -61,6 +61,35 @@ def _gap_pt(ws):
     return cap - content
 
 
+def plan_visible_sheets(wb):
+    """Plan insert/delete ops for visible sheets only; hidden sheets are skipped.
+
+    Returns (plans, skipped) where plans is a list of
+    (sheet_title, plan, gap_pt, template_row_height) tuples.
+    Kept separate from fill_workbook so the visible-only gate is unit-testable
+    without LibreOffice.
+    """
+    import row_plan
+    plans, skipped = [], []
+    for ws in wb.worksheets:
+        # 只对显示状态的工作表做格式/增删行处理；隐藏表一律跳过。
+        # 与打印格式脚本（detail 407-408 / declare 940）保持一致。
+        if ws.sheet_state != 'visible':
+            skipped.append({'sheet': ws.title, 'reason': 'hidden_sheet'})
+            continue
+        plan = row_plan.plan_sheet(ws)
+        if plan.get('status') != 'proposal':
+            skipped.append({'sheet': ws.title, 'reason': plan.get('reason', 'skip')})
+            continue
+        gap = _gap_pt(ws)
+        if gap is None:
+            skipped.append({'sheet': ws.title, 'reason': 'no_print_area'})
+            continue
+        template_h = _row_height(ws, plan['first_subtotal_row'] - 1)
+        plans.append((ws.title, plan, gap, template_h))
+    return plans, skipped
+
+
 def fill_workbook(workbook, output, kind, java_home, soffice, uno_jars, bridge=None,
                   timeout=300):
     import row_plan
@@ -89,18 +118,8 @@ def fill_workbook(workbook, output, kind, java_home, soffice, uno_jars, bridge=N
         shutil.copyfile(workbook, base)
         from openpyxl import load_workbook
         wb = load_workbook(base)  # read-only planning pass on the copy
-        plans = []
-        for ws in wb.worksheets:
-            plan = row_plan.plan_sheet(ws)
-            if plan.get('status') != 'proposal':
-                skipped.append({'sheet': ws.title, 'reason': plan.get('reason', 'skip')})
-                continue
-            gap = _gap_pt(ws)
-            if gap is None:
-                skipped.append({'sheet': ws.title, 'reason': 'no_print_area'})
-                continue
-            template_h = _row_height(ws, plan['first_subtotal_row'] - 1)
-            plans.append((ws.title, plan, gap, template_h))
+        plans, plan_skips = plan_visible_sheets(wb)
+        skipped.extend(plan_skips)
         wb.close()
 
         for sheet, plan, gap, template_h in plans:

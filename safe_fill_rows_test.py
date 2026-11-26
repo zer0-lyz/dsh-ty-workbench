@@ -6,7 +6,29 @@ import unittest
 
 from openpyxl import Workbook
 
-from safe_fill_rows import fill_workbook
+from safe_fill_rows import fill_workbook, plan_visible_sheets
+
+
+class VisibleSheetTests(unittest.TestCase):
+    def test_hidden_sheets_are_skipped(self):
+        wb = Workbook()
+        visible = wb.active
+        visible.title = '可见表'
+        hidden = wb.create_sheet('隐藏表')
+        hidden.sheet_state = 'hidden'
+        very_hidden = wb.create_sheet('极隐藏表')
+        very_hidden.sheet_state = 'veryHidden'
+        plans, skipped = plan_visible_sheets(wb)
+        planned_names = {p[0] for p in plans}
+        self.assertNotIn('隐藏表', planned_names)
+        self.assertNotIn('极隐藏表', planned_names)
+        self.assertTrue(visible.title in planned_names or
+                        any(s['sheet'] == visible.title and
+                            s['reason'] != 'hidden_sheet' for s in skipped))
+        hidden_skips = {s['sheet']: s['reason'] for s in skipped
+                        if s['reason'] == 'hidden_sheet'}
+        self.assertEqual(hidden_skips['隐藏表'], 'hidden_sheet')
+        self.assertEqual(hidden_skips['极隐藏表'], 'hidden_sheet')
 
 
 class KindGateTests(unittest.TestCase):

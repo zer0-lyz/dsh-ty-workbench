@@ -81,97 +81,120 @@ def as_line(v):
 
 HEAD_MARK = ['项目', '行次']
 NOW_KEYS = ['期末余额', '期末数', '期末金额', '本期金额', '本期数', '本年累计', '本年累计数', '累计金额']
-PREV_KEYS = ['期初余额', '期初数', '上期金额', '上期数', '上年同期', '上年累计', '年初余额']
-SKIP_KEYS = ['对应试算科目', '科目', '编码', '校验', '备注', '说明']
+PREV_KEYS = ['期初余额', '期初数', '上期金额', '上期数', '上年同期', '上年累计', '年初余额',
+             '上年年末数', '上年年末余额', '上年数', '年初数']
+SKIP_KEYS = ['对应试算科目', '科目', '编码', '校验', '备注', '说明', '注释号', '附注']
+
+# 表头第一列可能叫什么：中汇报表模板写「项目」，企业自己编的报表常写「资 产」「负债和所有者权益」。
+NAME_HEADS = ('项目', '资产', '负债和所有者权益', '负债和股东权益', '资产和负债', '科目名称')
+
+
+def _is_amount_head(c):
+    for k in NOW_KEYS + PREV_KEYS:
+        if k in c:
+            return True
+    return False
 
 
 def is_head(cells):
+    """表头行判定。
+
+    中汇报表/审定报表模板：项目 + 行次 + 金额列。
+    但企业实际交上来的报表常常**没有「行次」列**，第一列还叫「资 产」，
+    表头是「资 产 | 注释号 | 期末数 | 上年年末数 | | 负债和所有者权益 | 注释号 | 期末数 | 上年年末数」。
+    两种都得认，否则真实报表一行都读不出来。
+    """
     joined = ''.join(compact(c) for c in cells)
-    return ('项目' in joined) and ('行次' in joined)
+    if '行次' in joined and '项目' in joined:
+        return True
+    # 没有行次：要求「项目/资产」这类名称列 + 至少一个本期列 + 至少一个上期列，
+    # 三样齐全才当表头，避免把数据行（比如「资产总计  100  90」）误判成表头。
+    if '行次' in joined:
+        return False
+    has_name = any(h in joined for h in NAME_HEADS)
+    if not has_name:
+        return False
+    now = prev = False
+    for c in cells:
+        c = compact(c)
+        if not c:
+            continue
+        for k in NOW_KEYS:
+            if k in c:
+                now = True
+                break
+        for k in PREV_KEYS:
+            if k in c:
+                prev = True
+                break
+    return now and prev
+
+
+def _name_head_at(cols, ci):
+    """这一列是不是「科目名称」列（表头那种「项目 / 资产 / 负债和所有者权益」）。
+
+    必须整格相等，不能 startswith：真实利润表里「资产减值损失」「负债合计」这类
+    科目名都以这些词开头，用前缀判断会把科目行当成右表表头，导致解析到一半就截断
+    （实测利润表只读出 15 行）。
+    """
+    c = cols[ci]
+    if not c:
+        return False
+    return c == '项目' or c in NAME_HEADS
+
+
+def _amount_kind(c):
+    """金额列表头 -> 'now' / 'prev' / None。"""
+    if not c:
+        return None
+    if any(k in c for k in SKIP_KEYS):
+        return None
+    for k in NOW_KEYS:
+        if k in c:
+            return 'now'
+    for k in PREV_KEYS:
+        if k in c:
+            return 'prev'
+    return None
 
 
 def find_header(rows, limit=25):
+    """找表头行，返回 {row, groups:[{name,line,amounts}]}。
+
+    兼容两种版式：
+      A. 中汇/审定报表模板：项目 | 行次 | 期末余额 | 期初余额（行次列必备）
+      B. 企业自制报表：资 产 | 注释号 | 期末数 | 上年年末数 | | 负债和所有者权益 | 注释号 | ...
+         —— 没有行次列，靠「名称列 + 本期列 + 上期列」认。
+    右侧并排的第二块（资产 | 负债）在两种版式下都支持。
+    """
     for ri, cells in enumerate(rows[:limit]):
         if not is_head(cells):
             continue
         cols = [compact(c) for c in cells]
+        anchors = [ci for ci in range(len(cols)) if _name_head_at(cols, ci)]
+        if not anchors:
+            continue
         groups = []
-        name_col = None
-        for ci, c in enumerate(cols):
-            if c == '项目':
-                name_col = ci
-                break
-        if name_col is None:
-            continue
-        ci = name_col + 1
-        # 行次列必须紧跟项目列
-        if ci >= len(cols) or '行次' not in cols[ci]:
-            continue
-        line_col = ci
-        amt_cols = []
-        for cj in range(line_col + 1, len(cols)):
-            c = cols[cj]
-            if not c:
-                continue
-            if c == '项目':
-                break
-            if any(k in c for k in SKIP_KEYS):
-                continue
-            if '校验' in c:
-                break
-            kind = None
-            for k in NOW_KEYS:
-                if k in c:
-                    kind = 'now'
+        for gi, name_col in enumerate(anchors):
+            stop = anchors[gi + 1] if gi + 1 < len(anchors) else len(cols)
+            # 行次列：紧跟名称列、且表头写着「行次」。真实报表通常没有。
+            line_col = None
+            for cj in range(name_col + 1, min(name_col + 3, stop)):
+                if '行次' in cols[cj]:
+                    line_col = cj
                     break
-            if kind is None:
-                for k in PREV_KEYS:
-                    if k in c:
-                        kind = 'prev'
-                        break
-            if kind is not None:
-                amt_cols.append({'col': cj, 'label': c, 'kind': kind})
-        if not amt_cols:
-            continue
-        groups.append({'name': name_col, 'line': line_col, 'amounts': amt_cols})
-        # 右边还有一组（资产负债表左右并排）：后面再找一个「项目」列
-        for cj in range(line_col + 1, len(cols)):
-            if cols[cj] != '项目':
-                continue
-            lc = None
-            for ck in range(cj + 1, min(cj + 3, len(cols))):
-                if '行次' in cols[ck]:
-                    lc = ck
-                    break
-            if lc is None:
-                continue
-            amts = []
-            for ck in range(lc + 1, len(cols)):
-                c = cols[ck]
-                if not c:
+            amt_cols = []
+            for cj in range(name_col + 1, stop):
+                if cj == line_col:
                     continue
-                if c == '项目':
-                    break
-                if any(k in c for k in SKIP_KEYS):
-                    continue
-                if '校验' in c:
-                    break
-                kind = None
-                for k in NOW_KEYS:
-                    if k in c:
-                        kind = 'now'
-                        break
-                if kind is None:
-                    for k in PREV_KEYS:
-                        if k in c:
-                            kind = 'prev'
-                            break
+                kind = _amount_kind(cols[cj])
                 if kind is not None:
-                    amts.append({'col': ck, 'label': c, 'kind': kind})
-            if amts:
-                groups.append({'name': cj, 'line': lc, 'amounts': amts})
-                break
-        return {'row': ri, 'groups': groups}
+                    amt_cols.append({'col': cj, 'label': cols[cj], 'kind': kind})
+            if not amt_cols:
+                continue
+            groups.append({'name': name_col, 'line': line_col, 'amounts': amt_cols})
+        if groups:
+            return {'row': ri, 'groups': groups}
     return None
 
 
@@ -223,20 +246,26 @@ def head_item(name):
 
 def parse_block(rows, head, group, side, skip=()):
     out = []
+    line_col = group.get('line')
     for ri in range(head['row'] + 1, len(rows)):
         cells = rows[ri]
-        if group['name'] >= len(cells) or group['line'] >= len(cells):
+        if group['name'] >= len(cells):
             continue
         name = clean_name(cells[group['name']])
         if not name:
             continue
         if any(name.startswith(s) for s in skip):
             continue
-        if head_item(name):
+        if head_item(name) or _name_head_at([compact(c) for c in cells], group['name']):
             # 左右两块在纵向不是对齐的：模板把右表的「项目/行次」表头又印了一份，
             # 看到它就说明右表到底了，再往下都是注释和签章。
-            break
-        ln = as_line(cells[group['line']])
+            # 没有行次的真实报表里，右侧表头也叫「负债和所有者权益」，同样到此为止。
+            if ri > head['row']:
+                break
+            continue
+        ln = None
+        if line_col is not None and line_col < len(cells):
+            ln = as_line(cells[line_col])
         vals = []
         for a in group['amounts']:
             vals.append(parse_amount(cells[a['col']]) if a['col'] < len(cells) else None)
@@ -264,13 +293,43 @@ def find_unit(cells):
     return ''
 
 
+# Excel 日期序列号起点：1900 系统下 1 = 1900-01-01，但因历史 bug 实际用 1899-12-30 作基准。
+_EXCEL_EPOCH = (1899, 12, 30)
+
+
+def _excel_serial_to_date(v):
+    """Excel 把日期存成序列号（如 46022 = 2025-12-31）。xlrd 读出来就是这种 float。"""
+    if not isinstance(v, (int, float)) or isinstance(v, bool):
+        return ''
+    n = int(v)
+    if n < 20000 or n > 80000:      # 1954 ~ 2119 之外不当日期看，免得把金额当日期
+        return ''
+    import datetime
+    d = datetime.date(*_EXCEL_EPOCH) + datetime.timedelta(days=n)
+    return '%d年%d月%d日' % (d.year, d.month, d.day)
+
+
 def find_period(cells, default=''):
+    """从表头上方找报告期。
+
+    真实报表的日期有三种写法，都要认：
+      - 文本：'2025年12月31日' / '2025年度'
+      - Excel 序列号：46022.0（就是 2025-12-31），xlrd/openpyxl 读出来是 float
+    注意：有的企业报表表头年份本身写错（实测 24 年那个文件资产负债表写 45291=2023-12-31、
+    利润表写 '2023年度'，但对账关系显示它其实是 2024 年）。所以这里读出来的年份
+    只作为「参考值」，最终年度由 finance_scan.py 结合文件名和对账关系定。
+    """
     for row in cells:
         for c in row:
             t = norm(c)
             m = re.search(r'(\d{4})\s*年\s*(\d{1,2})\s*月\s*(\d{1,2})\s*日', t)
             if m:
                 return '%s年%s月%s日' % (m.group(1), int(m.group(2)), int(m.group(3)))
+    for row in cells:
+        for c in row:
+            d = _excel_serial_to_date(c)
+            if d:
+                return d
     for row in cells:
         for c in row:
             t = norm(c)
@@ -304,11 +363,13 @@ def sheet_kind(sheet_name, rows, head):
     return None
 
 
-def parse_sheet(rows, sheet_name, year_hint=''):
+def parse_sheet(rows, sheet_name, year_hint='', force_kind=None):
+    """force_kind：人工指定这张表的性质（'balance'/'income'），覆盖自动判定。
+    目录批量扫描时，自动认不出的页靠它定性——只改「是哪张表」，不动行列怎么读。"""
     head = find_header(rows)
     if head is None:
         return None
-    kind = sheet_kind(sheet_name, rows, head)
+    kind = force_kind if force_kind in ('balance', 'income') else sheet_kind(sheet_name, rows, head)
     if kind is None:
         return None
     above = rows[:head['row'] + 1]
@@ -440,17 +501,28 @@ for _ln, _nm in SI_LEFT + SI_RIGHT:
 
 
 def capture_template(kind, rows, sides=None):
-    """按「行次」从源表里把模板名抓下来。
+    """从源表里把「这张报表自己的科目清单」抓下来。
 
-    各家企业拿到的审定报表模板行次会随准则更新漂移（新保险合同准则就插了两行），
-    死按中汇报表那份行次去挂会整体错位；行次是会计上的栏目号，以它为准，
-    名表只在源表缺这一行时兜底。
+    两条路：
+      1. 有行次（中汇/审定报表模板）：按行次抓。各家企业拿到的模板行次会随准则更新漂移，
+         行次是会计上的栏目号，以它为准最稳。
+      2. 没有行次（企业自制报表，如「资 产 | 注释号 | 期末数 | 上年年末数」）：
+         按源表出现顺序抓。这种情况下按名字去套中汇行次模板会大面积错位，
+         不如老实保留源表自己的科目顺序——科目名到天源 subjectName 的映射由 ty_map 负责。
     """
+    numbered = [r for r in rows if r.get('line') is not None]
+    if len(numbered) < max(1, len(rows) // 5):
+        # 第 2 条路：无行次，按源表顺序
+        out = []
+        for r in rows:
+            if sides and kind == 'balance' and r.get('side') not in sides:
+                continue
+            out.append({'line': None, 'name': r['name']})
+        return out
+
     got = {}
     side_of = {}
-    for r in rows:
-        if r.get('line') is None:
-            continue
+    for r in numbered:
         if sides and r.get('side') not in sides:
             continue
         got.setdefault(r['line'], r['name'])
@@ -487,36 +559,55 @@ def norm_mark(name):
 
 
 def match_template(kind, rows, tpl):
-    """按行次把解析出来的行挂到模板行上；行次对不上时按名称兜底。"""
+    """把解析出来的行挂到模板行上；行次对不上时按名称兜底。
+
+    同名科目在一张表里可能出现多次（资产负债表左右各有一个「其中：优先股」），
+    所以按名字兜底时每命中一行就把它从候选里取走，避免同一行被挂两次。
+    """
     by_line = {}
     by_name = {}
     for r in rows:
         if r.get('line') is not None:
-            by_line.setdefault(r['line'], r)
-        by_name.setdefault(norm_mark(r['name']), r)
+            by_line.setdefault(r['line'], []).append(r)
+        by_name.setdefault(norm_mark(r['name']), []).append(r)
+
+    def take(bucket):
+        while bucket:
+            cand = bucket.pop(0)
+            if id(cand) not in used:
+                return cand
+        return None
+
     out = []
     used = set()
+
+    def attach(hit):
+        used.add(id(hit))
+        return {'matched': hit['name'], 'values': list(hit['values']),
+                'sourceLine': hit.get('line')}
+
     for t in tpl:
-        hit = by_line.get(t['line']) if t['line'] is not None else None
-        if hit is not None and norm_mark(hit['name']) != norm_mark(t['name']):
-            # 行次对上了但名字差得远：源表模板改过行次，退回按名字挂，
-            # 按名字也找不到就当成模板里这一行没有数（宁空勿错位）。
-            hit = by_name.get(norm_mark(t['name']))
+        hit = None
+        key = norm_mark(t['name'])
+        if t.get('line') is not None:
+            for cand in by_line.get(t['line'], []):
+                if norm_mark(cand['name']) == key and id(cand) not in used:
+                    hit = cand
+                    break
         if hit is None:
-            hit = by_name.get(norm_mark(t['name']))
+            hit = take(by_name.get(key, []))
+        row = {'line': t.get('line'), 'name': t['name'], 'matched': '', 'values': [], 'sourceLine': None}
         if hit is not None:
-            used.add(id(hit))
-        out.append({'line': t['line'], 'name': t['name'],
-                    'matched': hit['name'] if hit is not None else '',
-                    'values': list(hit['values']) if hit is not None else [],
-                    'sourceLine': hit.get('line') if hit is not None else None})
+            row.update(attach(hit))
+        out.append(row)
+
     extra = []
     for r in rows:
         if id(r) in used:
             continue
         if r['name'] in [t['name'] for t in tpl]:
             continue
-        extra.append({'line': r['line'], 'name': r['name'], 'side': r['side'], 'values': r['values']})
+        extra.append({'line': r.get('line'), 'name': r['name'], 'side': r['side'], 'values': r['values']})
     return out, extra
 
 
@@ -806,6 +897,71 @@ def main():
         book = read_workbook(path)
     except Exception as e:  # noqa: BLE001
         print(json.dumps({'ok': False, 'error': '%s: %s' % (type(e).__name__, e)}, ensure_ascii=True))
+        return
+    if (opts.get('mode') or '').strip() == 'dump':
+        # 导出一页的原始单元格文本：给「AI 兜底解析」用。
+        # 规则认不出的报表（版式奇形怪状、没有标准表头）就靠模型读这些格子把科目和金额捞出来。
+        max_rows = int(opts.get('maxrows') or 120)
+        max_cols = int(opts.get('maxcols') or 14)
+        only_sheet = only
+        sheets = []
+        for sn, rows in book:
+            if only_sheet and sn != only_sheet:
+                continue
+            grid = []
+            for ri, r in enumerate(rows[:max_rows]):
+                cells = []
+                for c in r[:max_cols]:
+                    if c is None:
+                        cells.append('')
+                    elif isinstance(c, float) and c == int(c) and abs(c) < 1e15:
+                        cells.append(str(int(c)))
+                    else:
+                        cells.append(str(c))
+                if any(x.strip() for x in cells):
+                    grid.append({'row': ri, 'cells': cells})
+            sheets.append({'sheet': sn, 'rows': grid})
+        print(json.dumps({'ok': True, 'file': os.path.basename(path), 'sheets': sheets},
+                         ensure_ascii=False))
+        return
+    if (opts.get('mode') or '').strip() == 'frommap':
+        # AI 兜底：模型把「科目名 → 本期/上期金额」抽成 JSON 后，回到这里拼天源科目。
+        # 科目名到天源 subjectName 的映射仍走 MAP_BALANCE / MAP_INCOME，
+        # 不在 JS 侧重写一份——同义词规则只该有一处。
+        raw = (opts.get('mapjson') or '').strip()
+        if not raw:
+            print(json.dumps({'ok': False, 'error': '缺少 --mapjson'}, ensure_ascii=True))
+            return
+        try:
+            mp = json.loads(raw)
+        except ValueError as e:
+            print(json.dumps({'ok': False, 'error': '--mapjson 不是有效 JSON：%s' % e}, ensure_ascii=True))
+            return
+        kind = 'income' if str(mp.get('kind') or '') == 'income' else 'balance'
+        sheet = str(mp.get('sheet') or (only or ''))
+        year = str(mp.get('year') or year_hint or '')
+        if not year:
+            print(json.dumps({'ok': False, 'error': '缺少年度'}, ensure_ascii=True))
+            return
+        tpl_rows = []
+        for r in (mp.get('rows') or []):
+            nm = str(r.get('name') or '').strip()
+            if not nm:
+                continue
+            tpl_rows.append({'line': None, 'name': nm,
+                             'values': [r.get('now'), r.get('prev')]})
+        sheet_data = explained_skip(kind, build_sheet(kind, tpl_rows, year, sheet))
+        st = {'statement': kind, 'sheet': sheet, 'year': year, 'unit': mp.get('unit') or '',
+              'period': mp.get('period') or '', 'columns': [], 'rows': [], 'template': tpl_rows}
+        pack = {
+            'statement': kind,
+            'statementType': 'balance_sheet' if kind == 'balance' else 'income_statement',
+            'sheet': sheet, 'year': int(year), 'unit': st['unit'], 'period': st['period'],
+            'columns': [], 'rows': [], 'rowsByKind': [],
+            'sheetData': sheet_data,
+        }
+        print(json.dumps({'ok': True, 'file': os.path.basename(path), 'statements': [pack]},
+                         ensure_ascii=False))
         return
     statements = []
     tried = []

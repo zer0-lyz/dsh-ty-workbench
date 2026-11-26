@@ -73,6 +73,11 @@ export const MGMT_FOLDER = '03评估底稿/管理类底稿';
 export const FIN_STATEMENT_DIR = '01财务报表';
 // 审计报告夹：每家公司 00财务资料/<公司> 下的固定子夹，事务所出具的审计报告 PDF/word 放这里。
 export const AUDIT_REPORT_DIR = '02审计报告';
+// 财务资料的公司级子目录（与 01财务报表 / 02审计报告 并排）。编号沿用旧的 02审计报告 不动，
+// 避免破坏既有项目目录；界面上按业务顺序排：报表 → 科目余额表 → 辅助余额表 → 序时账 → 审计报告。
+export const TB_DIR = '02科目余额表';
+export const AUX_DIR = '03辅助余额表';
+export const GL_DIR = '04序时账';
 // 认定是「报表原件」的扩展名，与 finance_scan.py 的 EXTS 保持一致
 // （csv 不在内：报表得靠工作表结构认「项目 + 行次」表头，纯文本 csv 没有这个概念）
 export const FIN_STATEMENT_EXTS = ['.xlsx', '.xlsm', '.xls'];
@@ -217,6 +222,9 @@ export function planProjectFolders(input) {
     // 报表原件夹：公司夹下固定一层，导入报表就按这个夹扫描
     push(base + '00财务资料/' + seg + '/' + FIN_STATEMENT_DIR);
     push(base + '00财务资料/' + seg + '/' + AUDIT_REPORT_DIR);
+    push(base + '00财务资料/' + seg + '/' + TB_DIR);
+    push(base + '00财务资料/' + seg + '/' + AUX_DIR);
+    push(base + '00财务资料/' + seg + '/' + GL_DIR);
     push(base + '02基础类/' + seg);
     BASIC_CATEGORIES.forEach(cat => push(base + '02基础类/' + seg + '/' + safeSeg(cat)));
 

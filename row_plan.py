@@ -41,40 +41,56 @@ _REF_RE = re.compile(r'(?<![A-Za-z0-9_$])\$?[A-Z]{1,3}\$?(\d+)(?![\d(])', re.I)
 
 
 def _print_bounds(ws):
-    """(first_row, last_row, last_col) of ws.print_area, or None."""
+    """(first_row, last_row, last_col) of ws.print_area, or None.
+
+    print_area may hold several comma-separated ranges; the first one wins.
+    range_boundaries returns (min_col, min_row, max_col, max_row) - unpacking
+    that in the wrong order silently enlarged last_col to the row count and
+    made every later scan walk thousands of phantom columns.
+    """
     area = ws.print_area
     if not area:
         return None
     try:
-        ref = str(area).split('!')[-1].replace('$', '')
-        a, b = ref.split(':')
-        _, r1, _, r2 = range_boundaries(f'{a}:{b}')
-        _, _, _, c2 = range_boundaries(str(area).split('!')[-1])
+        refs = str(area).split('!')[-1].split(',')[0]
+        refs = refs.replace('$', '')
+        a, b = refs.split(':')
+        _c1, r1, c2, r2 = range_boundaries(f'{a}:{b}')
         return r1, r2, c2
     except Exception:
         return None
 
 
+def _val(ws, r, c):
+    """Value at (r, c) without creating a cell (ws.cell would).
+
+    openpyxl's ws.cell() instantiates missing cells, which inflates max_row /
+    max_column and turns a scan of the used range into a quadratic walk.
+    """
+    cell = ws._cells.get((r, c))
+    return None if cell is None else cell.value
+
+
 def _find_header(ws, first_row, last_row):
     """Row whose cells A..E contain '序号'."""
     for r in range(first_row, last_row + 1):
-        if any(_normal(ws.cell(r, c).value) == '序号' for c in (1, 2, 3, 4, 5)):
+        if any(_normal(_val(ws, r, c)) == '序号' for c in (1, 2, 3, 4, 5)):
             return r
     return None
 
 
 def _total_candidates(ws, header, last_row):
     return [r for r in range(header + 1, last_row + 1)
-            if any(_total_label(ws.cell(r, c).value) for c in (1, 2, 3))]
+            if any(_total_label(_val(ws, r, c)) for c in (1, 2, 3))]
 
 
 def _block_ok(ws, boundary, last_row, max_col):
     """Validate the footer block [boundary..last_row]. Returns None or a reason."""
     for r in range(boundary, last_row + 1):
-        label = _normal(ws.cell(r, 1).value)
+        label = _normal(_val(ws, r, 1))
         labelled = bool(_LABELLED_TOTAL_RE.match(label))
         for c in range(1, max_col + 1):
-            v = ws.cell(r, c).value
+            v = _val(ws, r, c)
             if v is None:
                 continue
             if isinstance(v, str) and v.startswith('='):
@@ -126,16 +142,29 @@ def plan_sheet(ws):
             reason = bad
     if not boundary or boundary <= header + 1:
         return {'sheet': ws.title, 'status': 'skip', 'reason': reason}
-    # All nonempty cells are evidence, including zeros, formula-only rows and comments.
+    # All nonempty cells are evidence, including zeros, formula-only rows and
+    # comments. Index them once: ws._cells can hold tens of thousands of
+    # entries and a per-row rescan over it is quadratic.
+    occupied_index = set()
+    for (r, _c), cell in ws._cells.items():
+        if (cell.value is not None or cell.comment is not None
+                or cell.hyperlink is not None):
+            occupied_index.add(r)
+
     def occupied(r):
-        return any(c.value is not None or c.comment is not None or c.hyperlink is not None for c in ws[r])
+        return r in occupied_index
+
     occupied_rows = [r for r in range(header + 1, boundary) if occupied(r)]
     last = max(occupied_rows, default=header)
 
+    merge_spans = list(ws.merged_cells.ranges)
+
     def strictly_empty(r):
+        # row_dimensions.get() avoids creating a RowDimension for blank rows.
+        rd = ws.row_dimensions.get(r)
         return (not occupied(r)
-                and not ws.row_dimensions[r].hidden
-                and not any(m.min_row <= r <= m.max_row for m in ws.merged_cells.ranges))
+                and not (rd is not None and rd.hidden)
+                and not any(m.min_row <= r <= m.max_row for m in merge_spans))
 
     # Delete candidates start at the row immediately after the last occupied
     # row (表数据最后一行的下一行) and extend while strictly empty/visible/unmerged.
@@ -144,7 +173,7 @@ def plan_sheet(ws):
     while r < boundary and strictly_empty(r):
         delete_run.append(r)
         r += 1
-    crossings = [str(m) for m in ws.merged_cells.ranges if m.min_row < boundary <= m.max_row]
+    crossings = [str(m) for m in merge_spans if m.min_row < boundary <= m.max_row]
     if crossings:
         return {'sheet': ws.title, 'status': 'skip', 'reason': 'merge_crosses_insertion_boundary', 'merges': crossings}
     return {'sheet': ws.title, 'status': 'proposal', 'family': 'generic_bottom_total',
