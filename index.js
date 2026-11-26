@@ -1,6 +1,6 @@
 import { Buffer } from 'node:buffer';
 import { readFile, mkdir, mkdtemp, writeFile, rm, readdir, copyFile, rename, realpath, stat, link } from 'node:fs/promises';
-import { writeFileSync, existsSync, statSync, readFileSync } from 'node:fs';
+import { writeFileSync, existsSync, statSync, readFileSync, realpathSync, readdirSync } from 'node:fs';
 import { join, sep, dirname, relative, isAbsolute, basename } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { homedir } from 'node:os';
@@ -25,7 +25,7 @@ import * as lib from './library.js';
 import * as kbqa from './kbqa.js';
 import * as scanner from './scanner.js';
 import * as store from './store.js';
-import { planProjectFolders } from './folders.js';
+import { planProjectFolders, FIN_STATEMENT_DIR } from './folders.js';
 import { folderTemplateRequest, readFolderTemplate, folderTemplatePlan } from './folder-template.js';
 import { dataToolsRoutes, DATA_TOOLS_REV } from './data-tools.js';
 import { reportFormatRequest } from './report-format.js';
@@ -50,6 +50,9 @@ function rememberExportBatch(dir) {
 }
 // 导出进度快照：前端用随机 jobId 轮询，任务结束即删除。
 const exportProgress = new Map();
+// 导出取消登记：jobId -> { flag, procs:Set<ChildProcess> }。「终止任务」置 flag 并杀子进程；
+// runTyExport / runManualWorkflow 在每个 await 后与循环边界查 flag，安全收尾（已复制的工作簿保留）。
+const exportCancel = new Map();
 
 // 「不导出基线」那条路的现场凭据。
 //
@@ -393,16 +396,31 @@ async function qccLookupCompany(ctx, name) {
 // 优先使用工作台专用 venv（见 python/requirements.txt 的依赖清单）。
 const WORKBENCH_VENV_PY = join(homedir(), '.dsh', 'workbench-venv',
   ...(process.platform === 'win32' ? ['Scripts', 'python.exe'] : ['bin', 'python3']));
+// macOS 上 PATH 里的 python3 往往是 Homebrew 那个（只有 openpyxl、没有 xlrd），
+// 而系统自带 /usr/bin/python3、python.org 安装的那几个才常把 xlrd 也装上。
+// 只列命令名会永远命中缺库的那一个，于是 .xls 报表静默读不出来——
+// 所以非 Windows 下把常见绝对路径也列上，由 orderedPythons() 按实际装了哪些库重新排序。
+const MAC_PYTHON_PATHS = process.platform === 'darwin'
+  ? [
+      '/opt/homebrew/bin/python3',
+      '/usr/local/bin/python3',
+      '/usr/bin/python3',
+      '/Library/Frameworks/Python.framework/Versions/3.14/bin/python3',
+      '/Library/Frameworks/Python.framework/Versions/3.13/bin/python3',
+      '/Library/Frameworks/Python.framework/Versions/3.12/bin/python3',
+    ]
+  : [];
 const PYTHON_CANDIDATES = [
   process.env.DSH_WORKBENCH_PYTHON,
   WORKBENCH_VENV_PY,
   'python3',
   'python',
+  ...MAC_PYTHON_PATHS,
   ...(process.platform === 'win32' ? ['D:\\Anaconda3\\python.exe'] : []),
 ].filter(Boolean);
 const MINERU_CMD = process.env.DSH_WORKBENCH_MINERU || join(homedir(), 'AppData', 'Roaming', 'npm', 'mineru-open-api.cmd');
 
-function runCli(exe, args, timeoutMs, extraEnv) {
+function runCli(exe, args, timeoutMs, extraEnv, onSpawn) {
   return new Promise((resolve, reject) => {
     const env = { ...process.env };
     delete env.MINERU_TOKEN;
@@ -416,6 +434,7 @@ function runCli(exe, args, timeoutMs, extraEnv) {
     const argv = isBatch ? ['/c', exe, ...args] : args;
     let child;
     try { child = spawn(cmd, argv, { env, windowsHide: true }); } catch (e) { reject(e); return; }
+    if (typeof onSpawn === 'function') { try { onSpawn(child); } catch (_) {} }
     let out = '', err = '';
     const timer = setTimeout(() => { try { child.kill(); } catch (e) {} reject(new Error('解析超时（' + Math.round(timeoutMs / 1000) + 's）')); }, timeoutMs);
     child.stdout.on('data', d => { out += d.toString('utf8'); });
@@ -423,6 +442,66 @@ function runCli(exe, args, timeoutMs, extraEnv) {
     child.on('error', e => { clearTimeout(timer); reject(e); });
     child.on('close', code => { clearTimeout(timer); resolve({ code, stdout: out, stderr: err }); });
   });
+}
+
+// 按「要什么库」挑解释器：本机常有多个 python，`.xls` 只有装了 xlrd 的那个读得动。
+// 以前只按 PYTHON_CANDIDATES 顺序硬试，第一命中 /opt/homebrew/bin/python3（没 xlrd），
+// 于是 .xls 静默报 ModuleNotFoundError、扫描结果 0 张报表——真实项目里就是这么踩的。
+const PY_MODULE_CACHE = new Map();
+async function pythonModules(py) {
+  if (PY_MODULE_CACHE.has(py)) return PY_MODULE_CACHE.get(py);
+  // 绝对路径且不存在的直接判无库，省一次 15 秒的失败等待
+  if (isAbsolute(py) && !existsSync(py)) {
+    const none = { xlrd: false, openpyxl: false, missing: true };
+    PY_MODULE_CACHE.set(py, none);
+    return none;
+  }
+  const code = [
+    'import json',
+    'try:',
+    '    import xlrd',
+    'except Exception:',
+    '    xlrd = None',
+    'try:',
+    '    import openpyxl',
+    'except Exception:',
+    '    openpyxl = None',
+    'print(json.dumps({"xlrd": bool(xlrd), "openpyxl": bool(openpyxl)}))',
+  ].join('\n');
+  let mods = { xlrd: false, openpyxl: false };
+  try {
+    const r = await runCli(py, ['-c', code], 15000);
+    if (r.code === 0) {
+      const j = parseFirstJson(r.stdout);
+      if (j) mods = { xlrd: !!j.xlrd, openpyxl: !!j.openpyxl };
+    }
+  } catch (e) { /* 探测失败就当没有 */ }
+  PY_MODULE_CACHE.set(py, mods);
+  return mods;
+}
+
+// 需要哪些库（按参数里的扩展名推断）：库齐的解释器排前面，缺库的排后面，
+// 保证能干活的先干；都缺时仍按原顺序试，脚本自己会报缺库原因。
+async function orderedPythons(need) {
+  const want = need || [];
+  const rows = [];
+  for (let i = 0; i < PYTHON_CANDIDATES.length; i++) {
+    const py = PYTHON_CANDIDATES[i];
+    const mods = await pythonModules(py);
+    rows.push({ py, i, ok: want.every((m) => mods[m]) && !mods.missing,
+      have: mods.missing ? -1 : (mods.xlrd ? 1 : 0) + (mods.openpyxl ? 1 : 0) });
+  }
+  // 先按「满足必需库」排，再按「库更全」排：装了 xlrd+openpyxl 的解释器严格更强，
+  // 排前面就能直接吃 .xls；都没有时退回原顺序，由脚本自己报缺库原因。
+  rows.sort((a, b) => (b.ok - a.ok) || (b.have - a.have) || (a.i - b.i));
+  return rows.map((r) => r.py);
+}
+
+function needForArgs(args) {
+  const names = (args || []).map((a) => String(a || '').toLowerCase());
+  // .xls（老二进制格式）必需 xlrd；xlsx/xlsm 只要 openpyxl
+  if (names.some((n) => n.endsWith('.xls'))) return ['xlrd'];
+  return [];
 }
 
 async function pythonText(file) {
@@ -773,7 +852,7 @@ async function applyBodyFontNormalize(file) {
 async function financeScript(args) {
   const script = fileURLToPath(new URL('./finance_import.py', import.meta.url));
   let lastErr = null;
-  for (const py of PYTHON_CANDIDATES) {
+  for (const py of await orderedPythons(needForArgs(args))) {
     try {
       const r = await runCli(py, [script, ...args], 60000);
       if (r.code !== 0) { lastErr = new Error((r.stderr || '').slice(0, 300) || ('python 退出码 ' + r.code)); continue; }
@@ -791,7 +870,7 @@ async function financeScript(args) {
 async function financeStatementScript(args) {
   const script = fileURLToPath(new URL('./finance_statement.py', import.meta.url));
   let lastErr = null;
-  for (const py of PYTHON_CANDIDATES) {
+  for (const py of await orderedPythons(needForArgs(args))) {
     try {
       const r = await runCli(py, [script, ...args], 120000);
       if (r.code !== 0) { lastErr = new Error((r.stderr || '').slice(0, 300) || ('python 退出码 ' + r.code)); continue; }
@@ -802,6 +881,113 @@ async function financeStatementScript(args) {
     } catch (e) { lastErr = e; }
   }
   throw lastErr || new Error('没有可用的 python（需要 openpyxl）');
+}
+
+// 报表原件夹批量扫描：交给 finance_scan.py（复用 finance_statement.py 的解析规则）。
+// 扫一个目录里的 xlsx/xls/xlsm，逐页认出「资 / 利」，输出可直接喂 prepare 的 sheetList 项。
+async function financeScanScript(args) {
+  const script = fileURLToPath(new URL('./finance_scan.py', import.meta.url));
+  let lastErr = null;
+  for (const py of await orderedPythons(needForArgs(args))) {
+    try {
+      const r = await runCli(py, [script, ...args], 180000);
+      if (r.code !== 0) { lastErr = new Error((r.stderr || '').slice(0, 300) || ('python 退出码 ' + r.code)); continue; }
+      const j = parseFirstJson(r.stdout);
+      if (!j) { lastErr = new Error('报表扫描脚本输出无法解析'); continue; }
+      if (!j.ok) { lastErr = new Error(j.error || '报表扫描脚本报错'); continue; }
+      return j;
+    } catch (e) { lastErr = e; }
+  }
+  throw lastErr || new Error('没有可用的 python（需要 openpyxl）');
+}
+
+
+// ---------- AI 兜底解析 ----------
+// 规则解析（finance_statement.py）认得标准版式，但真实项目里的报表千奇百怪：
+// 没有「行次」列、左右并排、科目名企业自己改、金额列叫法五花八门。
+// 这时候把整页单元格丢给模型，让它按业务常识读出「科目名 → 本期/上期金额」，
+// 再回到 python 侧按同一套 ty_map 规则落成天源模板。规则能认的绝不走 AI（慢且不稳）。
+const FIN_MAP_SHAPE = '{"kind":"balance|income","sheet":"","year":2023,"period":"","unit":"","rows":[{"name":"货币资金","now":123.45,"prev":""}]}';
+
+const FIN_MAP_SYSTEM = [
+  '你是资产评估机构的财务助理。下面是一张中国企业的财务报表（Excel 单元格原样导出，每行带行号）。',
+  '你要把表里的科目和金额读出来，输出一个 JSON 对象。只输出 JSON：不要解释、不要 markdown 代码块。',
+  '规则：',
+  '- kind：资产负债表填 "balance"，利润表填 "income"。看表头标题判断。',
+  '- rows[].name：科目名称，去掉行首的「一、」「其中：」「减：」「加：」和序号、以及所有空格；'
+    + '保留科目本名（如「货币资金」「营业收入」）。分节标题（只有「流动资产：」这种冒号的）不要输出。',
+  '- rows[].now：本期数 / 期末数；rows[].prev：上期数 / 上年同期数 / 年初数 / 上年年末数。',
+  '- 金额只写数字，不要千分位、不要货币符号；括号表示负数，写成 -123.45。空单元格给 ""，不要写 0。',
+  '- 表里可能有「注释号」「科目编码」这类列（911010 这种六位数），那不是金额，别当金额读。',
+  '- 资产负债表左右并排（资产在左、负债和所有者权益在右）时，两边科目都要收，按从上到下、先左后右的顺序。',
+  '- year：表头写的年份；period：表头期间原文（如「2025年12月31日」「2025年度」）。读不出给 ""。',
+  '输出结构：' + FIN_MAP_SHAPE,
+].join('\n');
+
+
+function yearFromSheetPeriod(period) {
+  const m = String(period || '').match(/(19|20)\d{2}/);
+  return m ? m[0] : '';
+}
+function yearFromFileName(name) {
+  const s = String(name || '');
+  const m = s.match(/(?<![0-9])((?:19|20)\d{2})(?![0-9])/);
+  if (m) return m[1];
+  const m2 = s.match(/(?:公司|报表|评估|审定|TB)[-_]?(\d{2})(?=[-_\s.．]|$)/i);
+  return m2 ? String(2000 + Number(m2[1])) : '';
+}
+
+async function financeDumpCells(py, file, sheet, maxRows) {
+  const script = fileURLToPath(new URL('./finance_statement.py', import.meta.url));
+  const args = [script, file, '--mode', 'dump'];
+  if (sheet) args.push('--sheet', sheet);
+  if (maxRows) args.push('--maxrows', String(maxRows));
+  const r = await runCli(py, args, 120000);
+  if (r.code !== 0) throw new Error((r.stderr || '').slice(0, 300) || ('python 退出码 ' + r.code));
+  const j = parseFirstJson(r.stdout);
+  if (!j || !j.ok) throw new Error((j && j.error) || '导出单元格失败');
+  return j;
+}
+
+async function financeFromMap(py, file, mp) {
+  const script = fileURLToPath(new URL('./finance_statement.py', import.meta.url));
+  const r = await runCli(py, [script, file, '--mode', 'frommap', '--mapjson', JSON.stringify(mp)], 120000);
+  if (r.code !== 0) throw new Error((r.stderr || '').slice(0, 300) || ('python 退出码 ' + r.code));
+  const j = parseFirstJson(r.stdout);
+  if (!j || !j.ok) throw new Error((j && j.error) || '拼装天源科目失败');
+  return j;
+}
+
+// 一页的具体解析交给模型。返回 { kind, sheet, year, period, unit, rows:[{name,now,prev}] }
+async function aiReadSheet(ctx, grid, fileName, sheetName, basedate, pick) {
+  const llm = readLlm(ctx);
+  if (!llm) throw new Error('宿主没有可用的模型服务' + await modelDiagnostics(ctx));
+  // 用户在下拉里指定的模型优先（不同模型读表能力差别很大，值得让人选）；
+  // 没选就用默认模型，再没有就从已注册 provider 里挑第一个。
+  const sel = (pick && pick.provider && pick.model)
+    ? { provider: String(pick.provider), model: String(pick.model) }
+    : await resolveModel(ctx);
+  if (!sel) throw new Error('没有可用的模型' + await modelDiagnostics(ctx));
+  const lines = (grid || []).map((r) => '第' + (r.row + 1) + '行: ' + JSON.stringify(r.cells));
+  const prompt = [
+    '文件名：' + fileName,
+    '页签名：' + sheetName,
+    basedate ? '项目评估基准日：' + basedate : '',
+    '单元格：',
+    lines.join('\n'),
+  ].filter(Boolean).join('\n');
+  const r = await streamOnce(llm, {
+    provider: sel.provider,
+    model: sel.model,
+    system: FIN_MAP_SYSTEM,
+    messages: [{ role: 'user', content: [{ type: 'text', text: prompt.slice(0, 60000) }] }],
+    temperature: 0.1,
+    maxTokens: 4000,
+    purpose: 'workbench-finance-sheet',
+  }, 120000);
+  const j = parseModelJson(r.text);
+  if (!j || !Array.isArray(j.rows)) throw new Error('模型没有返回可用的科目表');
+  return j;
 }
 
 async function equityScript(args) {
@@ -1336,10 +1522,25 @@ async function runTyExport(b) {
   const skillsDir = tyExportSkillsDir();
   const walkXlsx = walkXlsxFiles;   // 局部别名，下方沿用了原路由里的变量名
   let outDir = null;
+  let tyCancelEntry = null;   // 提升到 try 外：finally 里注销 exportCancel
   try {
     const jobId = /^[A-Za-z0-9_-]{6,64}$/.test(String(b.jobId || '')) ? String(b.jobId) : '';
     const setProg = patch => { if (!jobId) return; if (exportProgress.size > 50) { let oldest = null; for (const [k, v] of exportProgress) if (!oldest || v.at < oldest.at) oldest = { k, at: v.at }; if (oldest) exportProgress.delete(oldest.k); } exportProgress.set(jobId, { at: Date.now(), ...patch }); };
     const clearProg = () => { if (jobId) exportProgress.delete(jobId); };
+    // 取消登记：注册进 exportCancel；「终止任务」路由置 flag 并杀子进程。
+    const cancelEntry = jobId ? { flag: false, procs: new Set() } : null;
+    tyCancelEntry = cancelEntry;
+    if (cancelEntry) exportCancel.set(jobId, cancelEntry);
+    const cancelled = () => !!(cancelEntry && cancelEntry.flag);
+    const cancelledError = () => Object.assign(new Error('导出已取消'), { cancelled: true });
+    const cancelledReturn = () => { setProg({ stage: 'cancelled', status: 'cancelled', msg: '已取消' }); return { status: 499, body: { ok: false, cancelled: true, outDir, error: '导出已取消' } }; };
+    // 子进程登记：runCli 每次 spawn 后回调注册；进程退出即移除，终止时 SIGTERM 全部。
+    const onSpawn = child => {
+      if (!cancelEntry) return;
+      cancelEntry.procs.add(child);
+      child.on('close', () => cancelEntry.procs.delete(child));
+      child.on('error', () => cancelEntry.procs.delete(child));
+    };
     const cfg = KINDS[String(b.kind || '')];
     if (!cfg) return { status: 400, body: { ok: false, error: 'kind 必须是 detail（明细表）或 declare（申报表）' } };
     const projectId = String(b.projectId || '').trim();
@@ -1357,7 +1558,7 @@ async function runTyExport(b) {
 
     const tycpv = [process.env.TYCPV_BIN, '/usr/local/bin/tycpv', '/opt/homebrew/bin/tycpv'].find(x => x && existsSync(x)) || 'tycpv';
     const pyBin = existsSync(WORKBENCH_VENV_PY) ? WORKBENCH_VENV_PY : 'python3';
-    const verifyZip = (p) => runCli(pyBin, ['-c', 'import sys,zipfile; sys.exit(0 if zipfile.ZipFile(sys.argv[1]).testzip() is None else 2)', p], 120000);
+    const verifyZip = (p) => runCli(pyBin, ['-c', 'import sys,zipfile; sys.exit(0 if zipfile.ZipFile(sys.argv[1]).testzip() is None else 2)', p], 120000, undefined, onSpawn);
     const tail = (s, n) => String(s || '').trim().split(/\r?\n/).filter(Boolean).slice(-n).join(' ｜ ');
 
     const st0 = await store.config();
@@ -1383,7 +1584,8 @@ async function runTyExport(b) {
     const cliResults = [];
     if (!idList.length) {
       const args = [cfg.sub, '-p', projectId, '-o', outDir];
-      const cli = await runCli(tycpv, args, 15 * 60 * 1000);
+      const cli = await runCli(tycpv, args, 15 * 60 * 1000, undefined, onSpawn);
+      if (cancelled()) return cancelledReturn();
       if (cli.code !== 0) {
         clearProg();
         const why = tail(cli.stderr, 3) || tail(cli.stdout, 3);
@@ -1393,11 +1595,13 @@ async function runTyExport(b) {
       cliResults.push(outDir);
     } else {
       for (const [ci, cid] of idList.entries()) {
+        if (cancelled()) return cancelledReturn();
         const perDir = join(outDir, cid);
         await mkdir(perDir, { recursive: true });
         setProg({ stage: 'export', done: ci, total: idList.length, msg: '正在导出公司 ' + cid + '（' + (ci + 1) + '/' + idList.length + '）…' });
         const args = [cfg.sub, '-p', projectId, '-c', cid, '-o', perDir];
-        const cli = await runCli(tycpv, args, 15 * 60 * 1000);
+        const cli = await runCli(tycpv, args, 15 * 60 * 1000, undefined, onSpawn);
+        if (cancelled()) return cancelledReturn();
         if (cli.code !== 0) {
           const why = tail(cli.stderr, 3) || tail(cli.stdout, 3);
           if (/缺少 MCP token|本地登录.*过期/i.test(why)) return { status: 401, body: { ok: false, outDir, error: 'CLI 没有可用凭据。请到「工作 → 连接设置」点击「授权 CLI」并完成浏览器登录；MCP 和 CLI 授权相互独立。' } };
@@ -1436,6 +1640,7 @@ async function runTyExport(b) {
 
     const results = [];
     for (const [fi, src] of exported.entries()) {
+      if (cancelled()) return cancelledReturn();
       // basename 而不是切 '/'：Windows 反斜杠路径会切出带盘符的非法文件名。
       const base = basename(src);
       const dot = base.lastIndexOf('.');
@@ -1448,11 +1653,17 @@ async function runTyExport(b) {
       const stages = [];
       const warnings = [...footerWarnings];
       let reportPath = null, reportLinked = false;
-      setProg({ stage: 'process', done: fi, total: exported.length, file: stem, msg: '正在整理：' + stem });
+      // 单个工作簿要连续跑恢复公式→格式→页脚→增删行→校验（最长各 5~10 分钟），
+      // 每一步都推进度快照，前端才能看到实时阶段而不是几分钟不变的一条文案。
+      const step = msg => setProg({ stage: 'process', done: fi, total: exported.length, file: stem, msg: '第 ' + (fi + 1) + '/' + exported.length + ' 个 · ' + stem + '：' + msg });
+      step('开始整理');
       try {
         await copyFile(src, stage);
+        if (cancelled()) throw cancelledError();
         if (restoreFormulas) {
-          const r = await runCli(pyBin, [linkScript, stage], 5 * 60 * 1000);
+          step('恢复公式（asset-link-restore，最长 5 分钟）…');
+          const r = await runCli(pyBin, [linkScript, stage], 5 * 60 * 1000, undefined, onSpawn);
+          if (cancelled()) throw cancelledError();
           if (r.code !== 0) throw new Error('恢复公式失败：' + (tail(r.stderr, 3) || tail(r.stdout, 3) || ('退出码 ' + r.code)));
           const gen = join(dir, stageStem + '_链接恢复' + ext);
           if (!existsSync(gen)) throw new Error('恢复公式没有产出：' + gen);
@@ -1463,9 +1674,11 @@ async function runTyExport(b) {
         if (applyFormat) {
           // 申报脚本的格式动作保留；其自带的正则平移插删行跳过（--skip-fill），
           // 增删行统一由下方 safe_fill_rows（结构规则 + LibreOffice 桥）完成。
+          step('设置打印格式（最长 5 分钟）…');
           const fmtArgs = [fmtScript, stage, '--no-backup'];
           if (b.kind === 'declare') fmtArgs.push('--skip-fill');
-          const r = await runCli(pyBin, fmtArgs, 5 * 60 * 1000);
+          const r = await runCli(pyBin, fmtArgs, 5 * 60 * 1000, undefined, onSpawn);
+          if (cancelled()) throw cancelledError();
           if (r.code !== 0) throw new Error('设置格式失败：' + (tail(r.stderr, 3) || tail(r.stdout, 3) || ('退出码 ' + r.code)));
           stages.push('apply_format');
         }
@@ -1473,11 +1686,13 @@ async function runTyExport(b) {
         // 先写会被清空；restore 脚本不碰页脚，但同样在其后写入最稳妥。
         const footerInfo = footerByCompany.get(src);
         if (footerInfo) {
+          step('写入公司页脚…');
           const fargs = [FOOTER_SCRIPT, '--workbook', stage, '--kind', String(b.kind)];
           if (footerInfo.preparer) fargs.push('--preparer', footerInfo.preparer);
           if (footerInfo.date) fargs.push('--date', footerInfo.date);
           if (b.kind === 'detail' && footerInfo.appraisers) fargs.push('--appraisers', footerInfo.appraisers);
-          const fr = await runCli(pyBin, fargs, 120000);
+          const fr = await runCli(pyBin, fargs, 120000, undefined, onSpawn);
+          if (cancelled()) throw cancelledError();
           if (fr.code !== 0) throw new Error('写入页脚失败：' + (tail(fr.stderr, 3) || tail(fr.stdout, 3) || ('退出码 ' + fr.code)));
           stages.push('footer');
         }
@@ -1493,10 +1708,12 @@ async function runTyExport(b) {
           if (!fillReady) {
             warnings.push('自动增删行已暂停：缺少 LibreOffice/JDK 桥组件，未执行此步骤。');
           } else {
+            step('自动增删行以填满打印页（LibreOffice 逐表校验，最长 10 分钟）…');
             const fillOut = join(dir, stageStem + '_filled.xlsx');
             const fargs = [SAFE_FILL_SCRIPT, '--workbook', stage, '--output', fillOut, '--kind', String(b.kind),
               '--java-home', fillJavaHome, '--soffice', fillSoffice, '--uno-jars', fillJars, '--bridge', fillBridge];
-            const g = await runCli(pyBin, fargs, 600000);
+            const g = await runCli(pyBin, fargs, 600000, undefined, onSpawn);
+            if (cancelled()) throw cancelledError();
             let parsed = null;
             try { parsed = JSON.parse((g.stdout || '').trim().split('\n').pop()); } catch (_) {}
             if (g.code === 0 && parsed && parsed.ok && Array.isArray(parsed.changed) && parsed.changed.length > 0) {
@@ -1514,7 +1731,9 @@ async function runTyExport(b) {
         } else {
           warnings.push('打印页空白的自动增删行未启用。');
         }
+        step('校验文件完整性…');
         const v = await verifyZip(stage);
+        if (cancelled()) throw cancelledError();
         if (v.code !== 0) throw new Error('文件校验失败（zip 结构异常）');
         // 报告先以不覆盖方式发布；若工作簿提交失败，撤销本次报告发布。
         if (reportPath) { await link(reportTemp, reportPath); reportLinked = true; }
@@ -1541,6 +1760,9 @@ async function runTyExport(b) {
     };
   } catch (e) {
     return { status: 500, body: { ok: false, ...(outDir ? { outDir } : {}), error: String((e && e.message) || e) } };
+  } finally {
+    // 无论成功、失败还是取消，都注销取消登记；进度快照里保留 cancelled 状态供前端轮询收尾。
+    if (tyCancelEntry) exportCancel.delete(String(b.jobId || ''));
   }
 }
 
@@ -1938,7 +2160,41 @@ export function apply(ctx) {
   const G = globalThis;
   // 版本号写进 ~/.dsh/workbench-host-applied.json 的 rev 字段，排障时用来确认
   // 运行中的进程到底加载了哪一版宿主代码。改了宿主逻辑就往上加一。
-  const REV = 'rev62-merge-pr2';   // + 车辆评估模块（识别归档 + 上传天源权证索引 + 百度 OCR / MinerU 双引擎 + 用量统计）+ PR#2 合并（财务报表解析/数据工具/币种汇率），补回 rev58 页脚后处理块
+  const REV = 'rev70-ui-persist'; // rev70：+ 界面状态持久化（记住上次所在页签/子页/打开的项目/导出工作区参数：模式、打印格式、输出目录），存 settings.ui 与 settings.exportPrefs，localStorage+磁盘双写。rev69：+ 真实报表解析（无「行次」列、Excel 序列号日期、科目编码列、左右并排）+ python 按能力挑解释器（.xls 要 xlrd）+ AI 兜底解析（/project/finance/ai-parse，规则认不出的页交给模型读）。rev68：+ 财务报表文件夹批量导入（/project/finance/scan + finance_scan.py）。上一轮：+ 修复增删行规划阶段平方级退化：_print_bounds 把 range_boundaries 的第4个返回值(max_row)当成了 max_col，导致 _block_ok 对 3716 列调用 ws.cell 凭空造格、occupied 每行扫全部单元格；祥生明细表规划 620 秒→0.02 秒，整条链路 10分47秒→9.9秒，19 处变更与修复前一致；+ 加包名漂移自检：Loading 名与 package.json name 不一致会让宿主 nearestPackage 跳过 client bundle（侧栏消失但路由正常），apply 启动时扫各 profile 依赖并告警
+  // 自检：Loader 引用名必须与 package.json 的 name 逐字相等。
+  // 宿主的 dsh-client-modules 在 locatePkgJson → nearestPackage 里用
+  // `name === expectedPackageName` 认领包，不一致就返回 undefined → resolveMeta
+  // 返回 null → client bundle 被静默丢弃：侧栏【个人工作台】整个不出现，但
+  // 宿主路由照常注册、接口全正常，极难定位。踩过两次（b0bce42、609c425）。
+  // 这里直接扫各 profile 的依赖声明，找出「指向本插件目录、但键名与本包名不同」
+  // 的条目并告警——正是让侧栏消失的那种配置漂移。
+  try {
+    const selfDir = realpathSync(dirname(fileURLToPath(import.meta.url)));
+    const selfName = JSON.parse(readFileSync(join(selfDir, 'package.json'), 'utf8')).name;
+    const profilesRoot = join(homedir(), '.dsh', 'profiles');
+    const stray = [];
+    for (const prof of readdirSync(profilesRoot, { withFileTypes: true })) {
+      if (!prof.isDirectory()) continue;
+      const pkgPath = join(profilesRoot, prof.name, 'package.json');
+      if (!existsSync(pkgPath)) continue;
+      let decl;
+      try { decl = JSON.parse(readFileSync(pkgPath, 'utf8')); } catch { continue; }
+      for (const key of Object.keys(decl.dependencies || {})) {
+        if (key === selfName) continue;
+        const spec = String(decl.dependencies[key] || '');
+        if (!spec.startsWith('link:')) continue;
+        const target = spec.slice(5);
+        let real;
+        try { real = realpathSync(target); } catch { continue; }
+        if (real === selfDir) stray.push(prof.name + ' → 「' + key + '」');
+      }
+    }
+    if (stray.length) {
+      console.warn('[workbench] 以下 profile 用别名指向本插件，但别名与 package.json 的 name「' + selfName
+        + '」不一致，宿主会跳过 client bundle，侧栏【个人工作台】将不显示：' + stray.join('；')
+        + '。请把这些 profile 的 cordis.patch.yml、package.json(dependencies/bundles) 改成「' + selfName + '」。');
+    }
+  } catch { /* 自检失败不阻断插件加载 */ }
   // 路由归属表：path -> 「注册它的那个 apply() 实例」的 token。
   //
   // 为什么不用「REV 布尔标记挡住第二次 apply」：宿主半侧有两个 entry（主包 + 仅宿主的
@@ -3261,6 +3517,22 @@ export function apply(ctx) {
       },
     },
     {
+      // 终止进行中的导出任务（明细/申报导出与手动整理共用）：置取消标志并 SIGTERM 该任务
+      // 的全部子进程，3 秒后仍存活则 SIGKILL。已复制/已提交的工作簿保留，未处理的不再处理。
+      path: PREFIX + '/ty/export/cancel', methods: ['POST'], fetch: async (req) => {
+        const b = await req.json().catch(() => ({}));
+        const jobId = String(b.jobId || '');
+        const entry = exportCancel.get(jobId);
+        if (!entry) return json({ ok: false, error: '没有可终止的导出任务' }, 404);
+        entry.flag = true;
+        const p = exportProgress.get(jobId);
+        if (p) exportProgress.set(jobId, { ...p, stage: 'cancelled', status: 'cancelled', msg: '已取消' });
+        for (const c of entry.procs) { try { c.kill('SIGTERM'); } catch (_) {} }
+        setTimeout(() => { for (const c of entry.procs) { try { c.kill('SIGKILL'); } catch (_) {} } }, 3000).unref();
+        return json({ ok: true });
+      },
+    },
+    {
       // 导出页脚配置：按项目 × 公司存取（独立 JSON，不被前端整体保存冲掉）。
       // GET 与 POST 同 path：路由表按 path 去重（owners.has），必须合在一条路由里按 method 分发。
       path: PREFIX + '/ty/export/footers', methods: ['GET', 'POST'], fetch: async (req) => {
@@ -3318,13 +3590,38 @@ export function apply(ctx) {
           const body = await req.json();
           const jobId = /^[A-Za-z0-9_-]{6,64}$/.test(String(body.jobId || '')) ? String(body.jobId) : '';
           const { jobId: _ignored, ...workflowOptions } = body;   // jobId 仅用于进度，不进入工作流参数
-          const result = await runManualWorkflow({
-            ...workflowOptions,
-            onProgress: jobId ? p => exportProgress.set(jobId, { at: Date.now(), stage: 'process', ...p }) : undefined,
-          });
-          if (jobId) exportProgress.delete(jobId);
-          if (result.outDir) rememberExportBatch(await realpath(result.outDir));
-          return json(result);
+          // 取消登记与子进程注册：终止任务会杀掉正在运行的整理脚本并停止处理剩余文件。
+          const cancelEntry = jobId ? { flag: false, procs: new Set() } : null;
+          if (cancelEntry) exportCancel.set(jobId, cancelEntry);
+          const onSpawn = child => {
+            if (!cancelEntry) return;
+            cancelEntry.procs.add(child);
+            child.on('close', () => cancelEntry.procs.delete(child));
+            child.on('error', () => cancelEntry.procs.delete(child));
+          };
+          try {
+            const result = await runManualWorkflow({
+              ...workflowOptions,
+              onProgress: jobId ? p => exportProgress.set(jobId, { at: Date.now(), stage: 'process', ...p }) : undefined,
+              cancel: () => !!(cancelEntry && cancelEntry.flag),
+              onSpawn,
+            });
+            if (result.outDir) rememberExportBatch(await realpath(result.outDir));
+            // 成功收尾：清进度；被取消的收尾：保留 cancelled 快照供前端轮询确认。
+            if (jobId) {
+              if (cancelEntry && cancelEntry.flag) exportProgress.set(jobId, { at: Date.now(), stage: 'cancelled', status: 'cancelled', msg: '已取消' });
+              else exportProgress.delete(jobId);
+            }
+            return json(result);
+          } catch (e) {
+            if (jobId) {
+              if (cancelEntry && cancelEntry.flag) exportProgress.set(jobId, { at: Date.now(), stage: 'cancelled', status: 'cancelled', msg: '已取消' });
+              else exportProgress.delete(jobId);
+            }
+            return json({ ok: false, error: String(e?.message || e) }, 400);
+          } finally {
+            if (cancelEntry) exportCancel.delete(jobId);
+          }
         } catch (e) {
           return json({ ok: false, error: String(e?.message || e) }, 400);
         }
@@ -4176,6 +4473,125 @@ export function apply(ctx) {
           return json(out);
         } catch (e) {
           return json({ ok: false, error: String((e && e.message) || e).slice(0, 300) }, 400);
+        }
+      },
+    },
+    {
+      // 报表原件夹扫描：POST /project/finance/scan { folder, abs, company, basedate, force }
+      // 扫 00财务资料/<公司>/01财务报表 里的 xlsx/xls/xlsm，逐页认出「资 / 利」，
+      // 返回可直接喂 prepare_financial_statement_report_import 的 sheetList 项（packs）。
+      // force = {"文件名::页签名": "balance"|"income"|"skip"}，人工确认的分类覆盖自动判定。
+      // 目录不存在时顺手建出来（建完是空的，返回 0 个包，提示用户把报表放进去）。
+      path: PREFIX + '/project/finance/scan', methods: ['POST'], fetch: async (req) => {
+        try {
+          const b = await req.json().catch(() => ({}));
+          const folder = safeFolderName(b.folder || '');
+          const absBound = String(b.abs || '').trim();
+          if (!folder && !absBound) return json({ ok: false, error: '项目文件夹名不合法（先填项目编号与项目简称）' }, 400);
+          // 公司名是路径的一段：按文件夹名校验（拒绝 .. 与分隔符），别让扫描跑出 00财务资料 之外。
+          // 前端传的是 segSafe 过的名字，正常不会带这些字符；带了就是调用方有问题，直接拒。
+          const company = safeFolderName(b.company || '');
+          if (!company) return json({ ok: false, error: '缺少公司名称（或名称里有 / \\ 这类不能做目录名的字符）' }, 400);
+          let base = absBound ? await store.describeFolder(absBound, false) : null;
+          if (absBound && (!base || base.ok === false)) {
+            return json({ ok: false, error: (base && base.error) || ('项目文件夹不可用：' + absBound) }, 400);
+          }
+          if (!base || base.ok === false) {
+            base = folder ? await store.findProjectDir(folder) : null;
+            if (base && base.ok === false) base = null;
+          }
+          if (!base) return json({ ok: false, error: '项目文件夹不存在：' + (absBound || folder) }, 400);
+          // 与 folders.js 的 FIN_STATEMENT_DIR 保持一致：公司夹下固定一层
+          const parts = ['02现场资料', '企业提供资料', '00财务资料', company, FIN_STATEMENT_DIR];
+          const target = join(base.path, ...parts);
+          await mkdir(target, { recursive: true });
+          const extra = [];
+          const basedate = String(b.basedate || '').replace(/[^0-9-]/g, '').slice(0, 10);
+          if (basedate) extra.push('--basedate', basedate);
+          const force = b.force && typeof b.force === 'object' ? b.force : null;
+          if (force && Object.keys(force).length) extra.push('--force', JSON.stringify(force));
+          let out;
+          try {
+            out = await financeScanScript([target].concat(extra));
+          } catch (e) {
+            return json({ ok: false, error: String((e && e.message) || e).slice(0, 300), dir: target }, 400);
+          }
+          out.dir = target;
+          out.rel = parts.join('/');
+          return json(out);
+        } catch (e) {
+          return json({ ok: false, error: String((e && e.message) || e).slice(0, 300) }, 500);
+        }
+      },
+    },
+    {
+      // AI 兜底解析：POST /project/finance/ai-parse { folder, abs, company, targets:[{fileName,sheet}], basedate }
+      // 规则（finance_scan.py）认不出的页，把单元格原样丢给模型读一遍，再按同一套
+      // ty_map 落成天源科目。只处理调用方点名的页，不做全目录扫描——
+      // AI 慢且花钱，必须是用户看到「这几页没认出来」之后主动点的。
+      path: PREFIX + '/project/finance/ai-parse', methods: ['POST'], fetch: async (req) => {
+        try {
+          const b = await req.json().catch(() => ({}));
+          const folder = safeFolderName(b.folder || '');
+          const absBound = String(b.abs || '').trim();
+          const company = safeFolderName(b.company || '');
+          if (!company) return json({ ok: false, error: '缺少公司名称' }, 400);
+          let base = absBound ? await store.describeFolder(absBound, false) : null;
+          if (absBound && (!base || base.ok === false)) {
+            return json({ ok: false, error: (base && base.error) || ('项目文件夹不可用：' + absBound) }, 400);
+          }
+          if (!base || base.ok === false) {
+            base = folder ? await store.findProjectDir(folder) : null;
+            if (base && base.ok === false) base = null;
+          }
+          if (!base) return json({ ok: false, error: '项目文件夹不存在' }, 400);
+          const parts = ['02现场资料', '企业提供资料', '00财务资料', company, FIN_STATEMENT_DIR];
+          const dir = join(base.path, ...parts);
+          const basedate = String(b.basedate || '').replace(/[^0-9-]/g, '').slice(0, 10);
+          const targets = Array.isArray(b.targets) ? b.targets.slice(0, 12) : [];
+          if (!targets.length) return json({ ok: false, error: '没有指定要 AI 读的页' }, 400);
+
+          // 找一个能读这个文件的解释器（.xls 要 xlrd）
+          const need = needForArgs(targets.map((t) => String(t.fileName || '')));
+          const pys = await orderedPythons(need);
+          const py = pys[0];
+          if (!py) return json({ ok: false, error: '本机没有可用的 python' }, 400);
+
+          const packs = [];
+          const errors = [];
+          for (const t of targets) {
+            const fileName = safeFileSegment(String(t.fileName || ''));
+            const sheet = String(t.sheet || '').trim();
+            if (!fileName) { errors.push({ fileName: t.fileName, sheet, error: '文件名不合法' }); continue; }
+            const full = join(dir, fileName);
+            if (!existsSync(full)) { errors.push({ fileName, sheet, error: '文件不存在' }); continue; }
+            try {
+              const dumped = await financeDumpCells(py, full, sheet, 200);
+              const one = (dumped.sheets || [])[0];
+              if (!one) { errors.push({ fileName, sheet, error: '这一页是空的' }); continue; }
+              const mp = await aiReadSheet(ctx, one.rows || [], fileName, sheet, basedate,
+                b.provider && b.model ? { provider: b.provider, model: b.model } : null);
+              const yearSource = String(mp.year || yearFromSheetPeriod(mp.period) || yearFromFileName(fileName) || '');
+              if (!yearSource) {
+                errors.push({ fileName, sheet, error: '模型也没读出年度，请手动补' });
+                continue;
+              }
+              const built = await financeFromMap(py, full, Object.assign({}, mp, {
+                sheet, year: yearSource,
+              }));
+              const pack = (built.statements || [])[0];
+              if (!pack) { errors.push({ fileName, sheet, error: '拼装失败' }); continue; }
+              pack.fileName = fileName;
+              pack.sheet = sheet;
+              pack.viaAi = true;
+              packs.push(pack);
+            } catch (e) {
+              errors.push({ fileName, sheet, error: String((e && e.message) || e).slice(0, 200) });
+            }
+          }
+          return json({ ok: true, packs, errors, dir, rel: parts.join('/') });
+        } catch (e) {
+          return json({ ok: false, error: String((e && e.message) || e).slice(0, 300) }, 500);
         }
       },
     },
