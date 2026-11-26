@@ -4494,7 +4494,8 @@ window.__ModuleLoader__.load({
             type: 'button', className: 'pf-btn sm', style: { marginLeft: 'auto' },
             onClick: () => setMoreOpen(!moreOpen),
           }, moreOpen ? '收起更多 ▲' : '更多 ▼'),
-          moreOpen ? h('button', { type: 'button', className: 'pf-btn', onClick: () => openSub(financeFolderOf(cur.name)) }, '打开财务资料文件夹') : null),
+          moreOpen ? h('button', { type: 'button', className: 'pf-btn', onClick: () => openSub(financeFolderOf(cur.name)) }, '打开财务资料文件夹') : null,
+          moreOpen ? h('button', { type: 'button', className: 'pf-btn', onClick: () => openSub(financeStatementsFolderOf(cur.name)) }, '打开报表文件夹') : null),
         tyHintBox,
         box.lastResult
           ? h('p', { className: 'pf-hint', style: { marginTop: 8 } }, '上次导入：' + (box.lastResult.statementType === 'income_statement' ? '利润表' : '资产负债表') + ' · ' + (box.lastResult.mode === 2 ? '合并' : '单体') + ' · ' + String(box.lastResult.at || '').slice(0, 19).replace('T', ' ') + (box.lastResult.summary ? (' · 写入 ' + box.lastResult.summary.importedSubjectCount + ' 个科目') : ''))
@@ -8075,7 +8076,7 @@ window.__ModuleLoader__.load({
           : sub === 'vehicle' ? h(VehicleEval, { s, toast })
           : sub === 'ty' ? h(Tianyuan, { s, toast })
             : sub === 'tylive' ? h(TyProjects, { s, toast, go, onOpenProject: openProject })
-              : h(Projects, { s, toast, go, openId: uiOp || openProjectId, setOpenId: setOpenProjectId }),
+              : h(Projects, { s, toast, go, openId: uiOp, setOpenId: setOpenProjectId }),
       );
     }
 
