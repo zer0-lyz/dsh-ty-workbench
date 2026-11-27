@@ -1,101 +1,102 @@
 {
-  "name": "@zer0_y/dsh-ty-workbench",
-  "version": "1.0.6",
-  "private": false,
-  "type": "module",
-  "description": "个人工作台：资产评估项目管理与工时、考证学习规划与考试提醒、自选股行情与买卖点提醒",
-  "license": "MIT",
-  "repository": {
-    "type": "git",
-    "url": "git+https://github.com/zer0-lyz/dsh-workbench.git"
+ "name": "@zer0_y/dsh-ty-workbench",
+ "version": "1.0.6",
+ "private": false,
+ "type": "module",
+ "description": "个人工作台：资产评估项目管理与工时、考证学习规划与考试提醒、自选股行情与买卖点提醒",
+ "license": "MIT",
+ "repository": {
+  "type": "git",
+  "url": "git+https://github.com/zer0-lyz/dsh-workbench.git"
+ },
+ "keywords": [
+  "deepseek-harness",
+  "dsh-plugin",
+  "dsh-bundle",
+  "appraisal",
+  "valuation",
+  "workbench"
+ ],
+ "icon": "icon.svg",
+ "exports": {
+  ".": "./index.js",
+  "./client": "./client.js",
+  "./locale/*.json": "./locale/*.json",
+  "./icon": "./icon.svg",
+  "./package.json": "./package.json"
+ },
+ "files": [
+  "index.js",
+  "data-tools.js",
+  "report-format.js",
+  "client.js",
+  "cordis.patch.yml",
+  "locale/*.json",
+  "icon.svg",
+  "README.md",
+  "LICENSE",
+  "tianyuan.js",
+  "cli-auth.js",
+  "export-workflow.js",
+  "tianyuan-web.js",
+  "tianyuan-session.js",
+  "report-browser.js",
+  "opener.js",
+  "store.js",
+  "tysync.js",
+  "report-native.py",
+  "report-native-login.py",
+  "data/**",
+  "scanner.js",
+  "scan_kb.py",
+  "build_wiki.py",
+  "topic_digest.py",
+  "lint_wiki.py",
+  "library.js",
+  "kbqa.js",
+  "parse_doc.py",
+  "equity_import.py",
+  "finance_import.py",
+  "finance_scan.py",
+  "finance-allocation.js",
+  "company-folder-ownership.js",
+  "finance_multi_scan.py",
+  "finance_statement.py",
+  "folders.js",
+  "archive.js",
+  "report-baseline.js",
+  "report-compare-service.js",
+  "report-node-mapper.js",
+  "report-online-snapshot.js",
+  "report-online-full.js",
+  "report-write-channel.js",
+  "report-writeback.js",
+  "report-diff.py",
+  "normalize_body_fonts.py",
+  "skills/**"
+ ],
+ "dsh": {
+  "manifestVersion": 1,
+  "bundle": {
+   "patch": "./cordis.patch.yml"
   },
-  "keywords": [
-    "deepseek-harness",
-    "dsh-plugin",
-    "dsh-bundle",
-    "appraisal",
-    "valuation",
-    "workbench"
-  ],
-  "icon": "icon.svg",
-  "exports": {
-    ".": "./index.js",
-    "./client": "./client.js",
-    "./locale/*.json": "./locale/*.json",
-    "./icon": "./icon.svg"
-  },
-  "files": [
-    "index.js",
-    "data-tools.js",
-    "report-format.js",
-    "client.js",
-    "cordis.patch.yml",
-    "locale/*.json",
-    "icon.svg",
-    "README.md",
-    "LICENSE",
-    "tianyuan.js",
-    "cli-auth.js",
-    "export-workflow.js",
-    "tianyuan-web.js",
-    "tianyuan-session.js",
-    "report-browser.js",
-    "opener.js",
-    "store.js",
-    "tysync.js",
-    "report-native.py",
-    "report-native-login.py",
-    "data/**",
-    "scanner.js",
-    "scan_kb.py",
-    "build_wiki.py",
-    "topic_digest.py",
-    "lint_wiki.py",
-    "library.js",
-    "kbqa.js",
-    "parse_doc.py",
-    "equity_import.py",
-    "finance_import.py",
-    "finance_scan.py",
-    "finance-allocation.js",
-    "company-folder-ownership.js",
-    "finance_multi_scan.py",
-    "finance_statement.py",
-    "folders.js",
-    "archive.js",
-    "report-baseline.js",
-    "report-compare-service.js",
-    "report-node-mapper.js",
-    "report-online-snapshot.js",
-    "report-online-full.js",
-    "report-write-channel.js",
-    "report-writeback.js",
-    "report-diff.py",
-    "normalize_body_fonts.py",
-    "skills/**"
-  ],
-  "dsh": {
-    "manifestVersion": 1,
-    "bundle": {
-      "patch": "./cordis.patch.yml"
-    },
-    "client": {
-      "platform": "web",
-      "immediately": true,
-      "inject": [
-        "@deepseek-ai/dsh-client-locale",
-        "@deepseek-ai/dsh-client-ui-layout",
-        "@deepseek-ai/dsh-client-ui-sidebar",
-        "@deepseek-ai/dsh-client-ui-plugin-manager",
-        "@deepseek-ai/dsh-client-ui-sidebar-right",
-        "@deepseek-ai/dsh-client-ui-sidebar-browser"
-      ]
-    }
-  },
-  "publishConfig": {
-    "access": "public"
-  },
-  "scripts": {
-    "check": "node scripts/check.mjs"
+  "client": {
+   "platform": "web",
+   "immediately": true,
+   "inject": [
+    "@deepseek-ai/dsh-client-locale",
+    "@deepseek-ai/dsh-client-ui-layout",
+    "@deepseek-ai/dsh-client-ui-sidebar",
+    "@deepseek-ai/dsh-client-ui-plugin-manager",
+    "@deepseek-ai/dsh-client-ui-sidebar-right",
+    "@deepseek-ai/dsh-client-ui-sidebar-browser"
+   ]
   }
+ },
+ "publishConfig": {
+  "access": "public"
+ },
+ "scripts": {
+  "check": "node scripts/check.mjs"
+ }
 }
