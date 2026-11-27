@@ -5059,6 +5059,165 @@ export function apply(ctx) {
       },
     }));
 
+    // ---------- 天源财报/底稿导入桥接（对话直连天源原生两段式协议） ----------
+    // 这些工具把天源 MCP 的导入类工具透传给对话 agent，不新增业务逻辑：
+    // 预检（prepare_*，不写数据）→ 出 confirmationToken 与确认预览给用户看 →
+    // 用户明确确认后才调 execute_*（短期一次性凭证，服务端复查请求体未变才落库）。
+    // 写类工具的确认责任在对话流程：execute 必须拿到用户已看过预览的明确确认，禁止连续自动执行。
+    const tyImportTool = (name, remoteName, description, properties, required) => tools.register({
+      name,
+      isConcurrencySafe: () => false,
+      description,
+      parameters: { type: 'object', properties, required: required || Object.keys(properties), additionalProperties: false },
+      output: { schema: outSchema, render: (_a, v) => text(v) },
+      async execute(args) {
+        try {
+          const r = await ty.callTool(remoteName, args && typeof args === 'object' ? args : {});
+          if (r && r.isError) {
+            const t0 = Array.isArray(r.content) && r.content.find(c => c.type === 'text');
+            return { ok: false, error: (t0 && typeof t0.text === 'string' ? t0.text.slice(0, 500) : null) || '天源返回错误' };
+          }
+          return r && r.data !== undefined ? r.data : (r && r.structuredContent !== undefined ? r.structuredContent : r && r.content || null);
+        } catch (e) {
+          return { ok: false, error: String((e && e.message) || e).slice(0, 500) };
+        }
+      },
+    });
+
+    disposers.push(tyImportTool(
+      'workbench_financial_reports_get',
+      'get_financial_statement_reports',
+      '读取天源某项目某公司的财务报表数据（资产负债表/利润表，单体/合并口径），返回模拟前端工作表的数据视图。只读。',
+      {
+        projectId: { type: 'string', pattern: '^[0-9]+$', description: '天源数字项目 ID（tyId）。' },
+        companyId: { type: 'string', pattern: '^[0-9]+$', description: '公司数字 ID（get_project_companies 返回）。' },
+        statementType: { type: 'string', enum: ['balance_sheet', 'income_statement'], description: '可选，默认资产负债表。' },
+        reportMode: { type: 'integer', description: '可选报表口径：1 单体 / 2 合并（按天源页面约定）。' },
+        view: { type: 'string', description: '可选：spreadjs（默认工作表视图）或 raw（后端原始数据）。' },
+        includeEmptySubjects: { type: 'boolean', description: '可选：是否包含空科目行。' },
+      },
+      ['projectId', 'companyId'],
+    ));
+
+    disposers.push(tyImportTool(
+      'workbench_financial_import_prepare',
+      'prepare_financial_statement_report_import',
+      '预检一次财务报表导入：校验从 Excel 解析出的资产负债表/利润表数据，读取标准科目、科目对照表与已有报表，生成保存请求体、confirmationToken 和用户确认预览。本工具不写任何数据。成功返回后必须把预览（目标公司、年度、科目数、跳过行）展示给用户，等用户明确确认后才调 workbench_financial_import_execute。',
+      {
+        projectId: { type: 'string', pattern: '^[0-9]+$', description: '天源数字项目 ID（tyId）。' },
+        companyId: { type: 'string', pattern: '^[0-9]+$', description: '目标公司数字 ID。' },
+        statementType: { type: 'string', enum: ['balance_sheet', 'income_statement'], description: '本次导入的报表类型。' },
+        reportMode: { type: 'integer', description: '报表口径：1 单体 / 2 合并。' },
+        sourceFileName: { type: 'string', description: '可选：来源 Excel 文件名，写入审计预览。' },
+        missingSubjectPolicy: { type: 'string', enum: ['preserve_existing', 'clear'], description: '可选：模板里解析不出的科目如何处理，默认 preserve_existing。' },
+        includeRequestBody: { type: 'boolean', description: '可选：是否在预检结果里带最终保存请求体（排查对账用）。' },
+        sheetList: { type: 'array', description: '工作表数据项数组：每项含 reportYear、科目名→值映射（sheetData 结构，来自 workbench_finance_folder_scan 或人工解析的 Excel）。' },
+      },
+      ['projectId', 'companyId', 'statementType', 'reportMode', 'sheetList'],
+    ));
+
+    disposers.push(tyImportTool(
+      'workbench_financial_import_execute',
+      'execute_financial_statement_report_import',
+      '执行一次已预检通过的财务报表导入。仅当用户已查看 prepare 返回的预览并明确说「确认导入/执行」后才调用；凭证是短期一次性令牌，服务端执行前会复查请求体未被改动。禁止对同一 token 自动重试或跳过用户确认。',
+      {
+        confirmationToken: { type: 'string', description: 'workbench_financial_import_prepare 返回的确认令牌。' },
+        confirmed: { type: 'boolean', const: true, description: '必须为 true，且必须在用户明确确认后传入。' },
+      },
+      ['confirmationToken', 'confirmed'],
+    ));
+
+    disposers.push(tyImportTool(
+      'workbench_financial_config_save',
+      'save_financial_statement_config',
+      '保存天源某项目某公司的财务报表参数（口径/类型/期数/币种/单位），只改传入字段。仅在用户明确要求修改报表参数后调用。',
+      {
+        projectId: { type: 'string', pattern: '^[0-9]+$', description: '天源数字项目 ID（tyId）。' },
+        companyId: { type: 'string', pattern: '^[0-9]+$', description: '公司数字 ID。' },
+        reportMode: { type: 'integer', description: '可选：1 单体 / 2 合并。' },
+        modeId: { type: 'integer', description: '可选：报表类型 ID（按天源报表类型目录）。' },
+        reportPeriodNum: { type: 'integer', description: '可选：显示期数。' },
+        currency: { type: 'string', description: '可选：币种名称（按前端逻辑转 ID）。' },
+        unit: { type: 'string', description: '可选：金额单位。' },
+      },
+      ['projectId', 'companyId'],
+    ));
+
+    disposers.push(tyImportTool(
+      'workbench_draft_import_prepare',
+      'prepare_asset_based_approach_draft_import',
+      '预检一次资产基础法底稿导入：校验科目权限、字段格式和覆盖风险，生成确认预览，不获取编辑锁也不写数据。成功后把公司/科目/行数/覆盖清单展示给用户，等明确确认后再调 workbench_draft_import_execute。',
+      {
+        projectId: { type: 'string', pattern: '^[0-9]+$', description: '天源数字项目 ID（tyId）。' },
+        targetCompanyIds: { type: 'array', description: '目标公司数字 ID 数组（可一次写多家）。' },
+        sourceFileName: { type: 'string', description: '来源 Excel 文件名。' },
+        sourceFileSha256: { type: 'string', description: '可选：来源文件 SHA256，供追溯。' },
+        subjects: { type: 'array', description: '科目数据数组（科目名 + 申报字段值），结构见天源底稿导入协议。' },
+      },
+      ['projectId', 'targetCompanyIds', 'sourceFileName', 'subjects'],
+    ));
+
+    disposers.push(tyImportTool(
+      'workbench_draft_import_execute',
+      'execute_asset_based_approach_draft_import',
+      '执行一次已预检通过的资产基础法底稿导入（自动获取编辑锁、写入并释放锁）。仅当用户已查看预检预览并明确确认后调用；凭证一次性，禁止自动重试。',
+      {
+        confirmationToken: { type: 'string', description: 'workbench_draft_import_prepare 返回的确认令牌。' },
+        confirmed: { type: 'boolean', const: true, description: '必须为 true，且必须在用户明确确认后传入。' },
+      },
+      ['confirmationToken', 'confirmed'],
+    ));
+
+    // 文件夹扫描桥接：复用界面「从 01财务报表 导入」的本地扫描脚本，把扫描结果直接交给
+    // 对话 agent 去 prepare；只读本地文件，不写天源。目录不存在时建空目录并返回 0 包。
+    disposers.push(tools.register({
+      name: 'workbench_finance_folder_scan',
+      isConcurrencySafe: () => false,
+      description: '扫描本地工作台项目文件夹 02现场资料/企业提供资料/00财务资料/<公司>/01财务报表 里的 xlsx/xls/xlsm 报表原件，逐页识别资产负债表/利润表与所属年度，返回可直接喂 workbench_financial_import_prepare 的 sheetList 数据包。只读本地文件，不写天源；认不出的页会标记出来，可用 force 指定分类。',
+      parameters: {
+        type: 'object',
+        properties: {
+          folder: { type: 'string', description: '工作台项目文件夹名（项目编号_项目简称，如 20260623_湖州城投）。abs 与 folder 二选一。' },
+          abs: { type: 'string', description: '可选：项目文件夹绝对路径（已绑定过的目录）。' },
+          company: { type: 'string', description: '公司文件夹名（00财务资料 下的一层，通常是公司全名）。' },
+          basedate: { type: 'string', description: '可选：评估基准日 YYYY-MM-DD，帮助识别报表年度。' },
+          force: { type: 'object', additionalProperties: { type: 'string', enum: ['balance', 'income', 'skip'] }, description: '可选：人工分类覆盖，键为「文件名::页签名」。' },
+        },
+        required: ['company'],
+        additionalProperties: false,
+      },
+      output: { schema: outSchema, render: (_a, v) => text(v) },
+      async execute(args) {
+        const a = args && typeof args === 'object' ? args : {};
+        try {
+          const company = safeFolderName(String(a.company || ''));
+          if (!company) return { ok: false, error: '缺少公司名称（或名称里有 / \\ 这类不能做目录名的字符）' };
+          const absBound = String(a.abs || '').trim();
+          let base = absBound ? await store.describeFolder(absBound, false) : null;
+          if (absBound && (!base || base.ok === false)) return { ok: false, error: (base && base.error) || ('项目文件夹不可用：' + absBound) };
+          if (!base || base.ok === false) {
+            base = a.folder ? await store.findProjectDir(String(a.folder)) : null;
+            if (base && base.ok === false) base = null;
+          }
+          if (!base) return { ok: false, error: '项目文件夹不存在：' + (absBound || a.folder || '') };
+          const parts = ['02现场资料', '企业提供资料', '00财务资料', company, FIN_STATEMENT_DIR];
+          const target = join(base.path, ...parts);
+          await mkdir(target, { recursive: true });
+          const extra = ['--include-comparatives', '1'];
+          const basedate = String(a.basedate || '').replace(/[^0-9-]/g, '').slice(0, 10);
+          if (basedate) extra.push('--basedate', basedate);
+          const force = a.force && typeof a.force === 'object' ? a.force : null;
+          if (force && Object.keys(force).length) extra.push('--force', JSON.stringify(force));
+          const out = await financeScanScript([target].concat(extra));
+          out.dir = target;
+          out.rel = parts.join('/');
+          return out;
+        } catch (e) {
+          return { ok: false, error: String((e && e.message) || e).slice(0, 300) };
+        }
+      },
+    }));
+
     return () => { for (const d of disposers) { try { d(); } catch (_) {} } };
   }, 'workbench: agent tools');
 
