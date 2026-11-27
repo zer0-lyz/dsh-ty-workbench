@@ -2,7 +2,7 @@
 name: tianyuan-query
 description: |
   查询天源评估系统数据：项目列表、评估结论、公司评估方法汇总表、导出明细表/申报表。
-  触发条件：用户说"查评估结论 / 查天源项目 / 查某被评估单位的评估值 / 导明细表 / 导申报表"。
+  触发条件：用户说"查评估结论 / 查天源项目 / 查某被评估单位的评估值 / 导明细表 / 导申报表 / 批量导入财报 / 导入资产底稿"。
   优先用本 skill 的标准操作顺序，3 次工具调用内完成查询，不要去 OneDrive 目录翻文件、不要手写 MCP 握手脚本。
 ---
 
@@ -96,6 +96,17 @@ tycpv export-income-summary-table -p <projectId> [-c <companyIds>] -o <outDir>  
 - 不确定公司范围时不要传 `-c`，会导出该项目全部公司。
 - 不确定公司编号与简称的对应关系时，先核对 `get_project_companies`，再导出。
 - 成功后回读文件：确认存在、大小非零、工作表数量合理。
+
+## 财报/底稿批量导入：对话执行（需 DSH ≥ 2026-11-27 版插件）
+
+用户说"把 XX 公司 01财务报表 的报表导入天源 / 批量导入财报 / 导入资产底稿"时，走以下流程，**不要让用户去界面手点**：
+
+1. **扫描本地报表**：调 `workbench_finance_folder_scan`，传 `folder`（工作台项目文件夹名）+ `company`（00财务资料 下的公司文件夹名），可选 `basedate`。返回可直接喂 prepare 的 sheetList 数据包；认不出的页用 `force` 指定分类（balance/income/skip）。
+2. **预检（prepare，不写数据）**：调 `workbench_financial_import_prepare`（财报）或 `workbench_draft_import_prepare`（底稿），传 tyId + companyId(s) + sheetList/subjects。**必须把返回的预览（公司/年度/科目数/跳过行/覆盖清单）展示给用户**。
+3. **用户明确确认后**（回复"确认/执行"），才调 `workbench_financial_import_execute` 或 `workbench_draft_import_execute`，传 confirmationToken + confirmed:true。禁止跳过第 2 步展示、禁止对同一 token 自动重试、禁止用户未确认就连续执行。
+4. 查已有报表数据用 `workbench_financial_reports_get`（只读）；改报表参数（口径/类型/期数）用 `workbench_financial_config_save`，同样要先说明要改什么再执行。
+
+工具不可用时（旧版插件），如实说明只能走界面"从 01财务报表 批量导入"，不要手写 MCP 调用绕行。
 
 ## 数据纪律（硬约束）
 
