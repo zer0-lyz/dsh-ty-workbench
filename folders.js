@@ -212,10 +212,14 @@ export function planProjectFolders(input) {
   MGMT_CATEGORIES.forEach(cat => push(MGMT_FOLDER + '/' + safeSeg(cat)));
 
   const used = new Map();
+  const occupied = new Set(['00未分配财务资料']);
   companies.forEach(c => {
     const name = String((c && c.name) || '').trim();
     if (!name) return;
     const seg = uniqSeg(safeSeg(c.name), used);
+    const key = seg.normalize('NFC').toLowerCase();
+    if (occupied.has(key)) throw new Error('公司目录名称冲突，无法安全生成目录：' + seg);
+    occupied.add(key);
     const base = '02现场资料/企业提供资料/';
     // 财务类资料 + 基础类资料：每家公司一套（分类在前、公司在后）
     push(base + '00财务资料/' + seg);

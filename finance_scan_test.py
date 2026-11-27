@@ -75,6 +75,8 @@ def make_book(path, sheets):
 
 
 def scan(args):
+    if '--include-comparatives' not in args:
+        args = args + ['--include-comparatives', '0']
     r = subprocess.run([sys.executable, SCRIPT] + args,
                        stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     out = r.stdout.decode('utf-8', 'replace')
@@ -121,6 +123,85 @@ class FinanceScanTests(unittest.TestCase):
         self.assertEqual(d['summary']['packCount'], 4)   # 2 年 × (资 + 利)
         self.assertEqual(d['summary']['balanceYears'], [2022, 2023])
         self.assertEqual(d['summary']['incomeYears'], [2022, 2023])
+
+    def test_comparative_is_separate_candidate_and_does_not_override_year(self):
+        for year in (2022, 2023):
+            make_book(os.path.join(self.tmp, '审定报表-%d.xlsx' % year),
+                      [('资', [('%d年12月31日' % year,)] + BALANCE_ROWS), ('利', INCOME_ROWS)])
+        d = scan([self.tmp, '--include-comparatives', '1'])
+        prior = [p for p in d['packs'] if p.get('comparisonSource')]
+        self.assertEqual(len(prior), 1)
+        self.assertEqual(prior[0]['year'], 2021)
+        self.assertEqual(prior[0]['sheetData']['reportYear'], 2021)
+        self.assertIn('期初', prior[0]['period'])
+        self.assertEqual(len([p for p in d['packs'] if p['statementType'] == 'balance_sheet' and p['year'] == 2022]), 1)
+
+    def test_balance_comparative_requires_proven_date_and_column_order(self):
+        cases = [
+            ('missing-date', BALANCE_ROWS),
+            ('reversed', [('2024年12月31日',), ('项目', '行次', '期初余额', '期末余额')] + BALANCE_ROWS[1:]),
+            ('multi-group', [('2024年12月31日',),
+                ('项目', '行次', '期末余额', '期初余额', '负债和所有者权益', '行次', '期初余额', '期末余额'),
+                ('货币资金', 1, 1000, 900, '应付账款', 2, 400, 500),
+                ('资产总计', 30, 1000, 900, '负债和所有者权益总计', 60, 900, 1000)]),
+        ]
+        for label, rows in cases:
+            with self.subTest(label=label), tempfile.TemporaryDirectory(prefix='fscan-balance-safe-') as d:
+                make_book(os.path.join(d, '报表-2024.xlsx'), [('资产负债表', rows)])
+                result = scan([d, '--include-comparatives', '1'])
+                self.assertEqual([p['year'] for p in result['packs']], [2024])
+                self.assertFalse(any(p.get('comparisonSource') for p in result['packs']))
+
+    def test_balance_comparative_rejects_header_filename_year_conflict(self):
+        with tempfile.TemporaryDirectory(prefix='fscan-balance-year-') as d:
+            rows = [('2025年12月31日',)] + BALANCE_ROWS
+            make_book(os.path.join(d, '报表-2024.xlsx'), [('资产负债表', rows)])
+            result = scan([d, '--include-comparatives', '1'])
+            self.assertEqual([p['year'] for p in result['packs']], [2024])
+            self.assertEqual(result['packs'][0]['originalPeriod'], '2025年12月31日')
+            self.assertEqual(result['yearNotes'][0]['from'], 2025)
+            self.assertEqual(result['yearNotes'][0]['to'], 2024)
+            self.assertEqual(result['yearNotes'][0]['originalPeriod'], '2025年12月31日')
+            self.assertTrue(result['yearNotes'][0]['requiresConfirmation'])
+            self.assertFalse(result['needManual'])
+            self.assertFalse(any(p.get('comparisonSource') for p in result['packs']))
+
+    def test_income_annual_prior_period_candidate(self):
+        with tempfile.TemporaryDirectory(prefix='fscan-income-prior-') as d:
+            make_book(os.path.join(d, '公司25-评估.xlsx'), [('利润表', REAL_INCOME_ROWS)])
+            result = scan([d, '--include-comparatives', '1'])
+            candidate = next(p for p in result['packs'] if p.get('comparisonSource'))
+            self.assertEqual(candidate['year'], 2024)
+            self.assertEqual(candidate['sheetData']['reportYear'], 2024)
+            self.assertEqual(candidate['statementType'], 'income_statement')
+            amounts = {x['subjectName']: x['amount'] for x in candidate['sheetData']['detail']}
+            self.assertEqual(amounts['营业收入'], 290735522.8)
+            self.assertEqual(amounts['净利润'], 37286258.78)
+            self.assertIn('上年同期', candidate['columns'][0]['label'])
+            rows_2024 = list(REAL_INCOME_ROWS)
+            rows_2024[1] = ('2024年度', '', '', '', '')
+            make_book(os.path.join(d, '审定报表-2024.xlsx'), [('利润表', rows_2024)])
+            result = scan([d, '--include-comparatives', '1'])
+            self.assertFalse(any(p.get('comparisonSource') and p['year'] == 2024 for p in result['packs']))
+
+    def test_income_comparative_rejects_header_filename_year_conflict(self):
+        with tempfile.TemporaryDirectory(prefix='fscan-income-year-') as d:
+            make_book(os.path.join(d, '公司24-评估.xlsx'), [('利润表', REAL_INCOME_ROWS)])
+            result = scan([d, '--include-comparatives', '1'])
+            self.assertEqual([p['year'] for p in result['packs']], [2024])
+            self.assertEqual(result['packs'][0]['originalPeriod'], '2025年度')
+            self.assertEqual(result['yearNotes'][0]['originalPeriod'], '2025年度')
+            self.assertTrue(result['yearNotes'][0]['requiresConfirmation'])
+            self.assertFalse(result['needManual'])
+            self.assertFalse(any(p.get('comparisonSource') for p in result['packs']))
+
+    def test_income_quarter_not_prior_annual_candidate(self):
+        with tempfile.TemporaryDirectory(prefix='fscan-income-quarter-') as d:
+            rows = list(REAL_INCOME_ROWS)
+            rows[1] = ('2024年1-3月', '', '', '', '')
+            make_book(os.path.join(d, '公司24-评估.xlsx'), [('利润表', rows)])
+            result = scan([d, '--include-comparatives', '1'])
+            self.assertFalse(any(p.get('comparisonSource') for p in result['packs']))
 
     def test_year_and_type_on_each_pack(self):
         d = scan([self.tmp])

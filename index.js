@@ -1,7 +1,7 @@
 import { Buffer } from 'node:buffer';
-import { readFile, mkdir, mkdtemp, writeFile, rm, readdir, copyFile, rename, realpath, stat, link } from 'node:fs/promises';
+import { readFile, mkdir, mkdtemp, writeFile, rm, readdir, copyFile, rename, realpath, stat, lstat, link } from 'node:fs/promises';
 import { writeFileSync, existsSync, statSync, readFileSync, realpathSync, readdirSync } from 'node:fs';
-import { join, sep, dirname, relative, isAbsolute, basename } from 'node:path';
+import { join, sep, dirname, relative, isAbsolute, basename, resolve, parse } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { homedir } from 'node:os';
 import { spawn } from 'node:child_process';
@@ -36,6 +36,8 @@ import { applyWriteback, readContents } from './report-writeback.js';
 import { collectContentItemIds, FULL_CONTENT_CHUNK, MAX_FULL_ITEMS } from './report-online-full.js';
 import { buildOnlineSnapshot } from './report-online-snapshot.js';
 import { buildData as tySyncData, runSync as tySyncRun, resolveOpencliRoot, openSyncSpace } from './tysync.js';
+import { scanFinanceAllocation, resolveFinanceAllocation, copyFinanceAllocation, FINANCE_CATEGORIES } from './finance-allocation.js';
+import { inspectCompanyFolders, bindCompanyFolder, reconfirmCompanyFolderName, rebindMissingCompanyFolder, confirmCompanyFolderIdentity } from './company-folder-ownership.js';
 
 const name = 'workbench';
 const inject = ['connection'];
@@ -901,6 +903,165 @@ async function financeScanScript(args) {
   throw lastErr || new Error('没有可用的 python（需要 openpyxl）');
 }
 
+
+// ---------- 未分配财务资料分配 ----------
+// 从工作台持久数据读项目公司名单（可信来源，前端传的名单只作展示）：
+// 复现 client.js eqRows 的树展开（parentId 深度优先、孤儿当顶层、环截断），
+// 再按建目录口径过滤空名与「被评估单位」占位（这些行没建公司夹）。
+function unallocatedCompanyRows(stateData, projectId) {
+  const pid = String(projectId || '');
+  const eq = ((stateData && stateData.work && stateData.work.equity) || {});
+  const box = eq[pid];
+  const list = (box && Array.isArray(box.companies)) ? box.companies : [];
+  const ids = new Set();
+  for (const c of list) {
+    if (!c || c.id == null) continue;
+    const id = String(c.id);
+    if (ids.has(id)) throw new Error('项目公司 ID 不唯一');
+    ids.add(id);
+  }
+  const byId = {};
+  list.forEach(c => { if (c && c.id != null) byId[String(c.id)] = c; });
+  const kids = {};
+  list.forEach(c => {
+    if (!c || c.id == null) return;
+    const cid = String(c.id);
+    const pid2 = (c.parentId && byId[String(c.parentId)] && String(c.parentId) !== cid) ? String(c.parentId) : '';
+    (kids[pid2] || (kids[pid2] = [])).push(c);
+  });
+  const out = [];
+  const seen = {};
+  const walk = (pid2, depth) => {
+    if (depth > 12) return;
+    (kids[pid2] || []).forEach(c => {
+      const cid = String(c.id);
+      if (seen[cid]) return;
+      seen[cid] = 1;
+      out.push(c);
+      walk(cid, depth + 1);
+    });
+  };
+  walk('', 0);
+  list.forEach(c => {
+    if (!c || c.id == null) return;
+    const cid = String(c.id);
+    if (seen[cid]) return;
+    seen[cid] = 1;
+    out.push(c);
+  });
+  return out
+    .map(c => ({ id: String(c.id), name: String((c && c.name) || '').trim() }))
+    .filter(c => c.name && c.name !== '被评估单位');
+}
+
+// 只接受清单中身份、当前名称及实际目录均已验证的绑定。
+async function unallocatedCompanyDirs(root, projectId, rows) {
+  const ownership = await inspectCompanyFolders({ projectRoot: root, projectId: String(projectId), companies: rows.map(c => ({ companyId: c.id, name: c.name })) });
+  const map = Object.create(null), folders = [];
+  for (const row of ownership.rows) {
+    if (row.status === 'bound') { map[row.companyId] = row.folder; folders.push(row.folder); }
+  }
+  return { map, folders };
+}
+
+async function boundFinanceStatementDir(b, create) {
+  const { root, state } = await unallocatedRoot(b.abs, b.projectId);
+  const rows = unallocatedCompanyRows(state, b.projectId);
+  const id = String(b.companyId == null ? '' : b.companyId);
+  if (!rows.some(c => c.id === id)) throw new Error('公司不属于该项目');
+  const dirs = await unallocatedCompanyDirs(root, b.projectId, rows);
+  const company = dirs.map[id];
+  if (!company) throw new Error('公司目录未绑定、名称或目录身份已变化');
+  const parts = ['02现场资料', '企业提供资料', '00财务资料', company, FIN_STATEMENT_DIR];
+  const dir = join(root, ...parts);
+  if (create) { try { await mkdir(dir); } catch (e) { if (e.code !== 'EEXIST') throw e; } }
+  const info = await lstat(dir);
+  if (info.isSymbolicLink() || !info.isDirectory()) throw new Error('财务报表目录含符号链接或不是目录');
+  return { dir, parts };
+}
+
+async function unallocatedFolderCandidates(root) {
+  let dir = root;
+  for (const part of ['02现场资料', '企业提供资料', '00财务资料']) {
+    dir = join(dir, part);
+    let info;
+    try { info = await lstat(dir); } catch (e) { if (e.code === 'ENOENT') return []; throw e; }
+    if (info.isSymbolicLink() || !info.isDirectory()) throw new Error('财务资料路径含符号链接或不是目录：' + dir);
+  }
+  const folders = [];
+  for (const ent of await readdir(dir, { withFileTypes: true })) {
+    const name = ent.name;
+    if (!ent.isDirectory() || ent.isSymbolicLink() || name.normalize('NFC').toLocaleLowerCase('en-US') === '00未分配财务资料'.normalize('NFC').toLocaleLowerCase('en-US') || name === '.' || name === '..' || /[\\/:*?"<>|\u0000-\u001f]/.test(name) || /[. ]$/.test(name) || name.length > 180) continue;
+    const info = await lstat(join(dir, name));
+    if (info.isDirectory() && !info.isSymbolicLink()) folders.push(name);
+  }
+  return folders.sort();
+}
+
+// 仅使用持久项目记录的绑定；请求路径只用于核对，不得由客户端选择另一个项目根。
+async function unallocatedRoot(abs, projectId) {
+  const id = String(projectId == null ? '' : projectId).trim();
+  const raw = String(abs == null ? '' : abs).trim();
+  if (!id || !raw || !isAbsolute(raw)) throw new Error('缺少项目 ID 或绑定的绝对路径');
+  const st = await store.readState();
+  if (st.error || !st.data) throw new Error('无法读取持久项目数据，请先保存项目');
+  const projects = st.data.work && st.data.work.projects;
+  const matches = Array.isArray(projects) ? projects.filter(p => p && String(p.id) === id) : [];
+  if (matches.length !== 1) throw new Error('项目不存在或项目 ID 不唯一');
+  const bound = String(matches[0].folderPath || '').trim();
+  if (!bound || !isAbsolute(bound) || resolve(bound) !== resolve(raw)) throw new Error('请求目录与项目持久绑定不一致');
+  if (projects.some(p => p && p !== matches[0] && typeof p.folderPath === 'string' && isAbsolute(p.folderPath.trim()) && resolve(p.folderPath.trim()) === resolve(bound))) throw new Error('项目目录被多个项目绑定，无法安全识别归属');
+  // 检查绝对路径全部祖先，不能先 realpath（会掩盖符号链接）。
+  const root = resolve(bound);
+  let current = parse(root).root;
+  for (const part of root.slice(current.length).split(sep).filter(Boolean)) {
+    current = join(current, part);
+    const info = await lstat(current);
+    if (info.isSymbolicLink() || !info.isDirectory()) throw new Error('项目路径含符号链接或不是目录：' + current);
+  }
+  return { root, state: st.data };
+}
+
+// 不使用 recursive mkdir：先检查已有祖先，再逐级创建并复核每一级。
+// Node 无可移植 openat/mkdirat，无法消除本机进程并发替换目录的竞态。
+async function initUnallocatedDir(root) {
+  let target = root;
+  for (const part of ['02现场资料', '企业提供资料', '00财务资料', '00未分配财务资料']) {
+    target = join(target, part);
+    try { await mkdir(target); } catch (e) { if (e.code !== 'EEXIST') throw e; }
+    const info = await lstat(target);
+    if (info.isSymbolicLink() || !info.isDirectory()) throw new Error('未分配资料路径含符号链接或不是目录：' + target);
+  }
+  return target;
+}
+
+function unallocatedSourceDir(root) {
+  return join(root, '02现场资料', '企业提供资料', '00财务资料', '00未分配财务资料');
+}
+
+// 单个前端选择 {name, sourceHash, companyId, category} → finance-allocation 的 Selection。
+// 快照字段（size/hash/dev/ino）一律来自后端现扫，company 一律来自可信映射——前端传值只用来对账。
+function unallocatedMapItem(it, snap, dirs) {
+  const name = String((it && it.name) || '');
+  const sourceHash = String((it && it.sourceHash) || '');
+  const companyId = String((it && it.companyId) || '');
+  const category = String((it && it.category) || '');
+  if (!name || !/^[0-9a-f]{64}$/.test(sourceHash)) throw new Error('文件缺少有效扫描指纹，请重新扫描后再分配');
+  const dir = dirs.map[companyId];
+  if (!dir) throw new Error('目标公司不在该项目公司名单中');
+  if (FINANCE_CATEGORIES.indexOf(category) < 0) throw new Error('资料类别无效：' + category);
+  const f = ((snap && snap.files) || []).find(x => x && x.name === name && !x.error);
+  if (!f) throw new Error('文件已不在未分配目录中（可能已被分配或删除），请重新扫描');
+  if (f.hash !== sourceHash) throw new Error('文件内容与扫描时不一致，请重新扫描');
+  // companyId / sourceHash 是回传前端对账用的附加字段，finance-allocation 只取它认识的键
+  return { name, size: f.size, hash: f.hash, dev: f.dev, ino: f.ino, company: dir, category, companyId, sourceHash };
+}
+
+// 批量映射（apply 用）：任一项映射失败整批阻止，先于任何复制动作。
+function unallocatedSelections(items, snap, dirs) {
+  if (!Array.isArray(items) || !items.length) throw new Error('请先勾选要分配的文件');
+  return items.map(it => unallocatedMapItem(it, snap, dirs));
+}
 
 // ---------- AI 兜底解析 ----------
 // 规则解析（finance_statement.py）认得标准版式，但真实项目里的报表千奇百怪：
@@ -2160,7 +2321,7 @@ export function apply(ctx) {
   const G = globalThis;
   // 版本号写进 ~/.dsh/workbench-host-applied.json 的 rev 字段，排障时用来确认
   // 运行中的进程到底加载了哪一版宿主代码。改了宿主逻辑就往上加一。
-  const REV = 'rev70-ui-persist'; // rev70：+ 界面状态持久化（记住上次所在页签/子页/打开的项目/导出工作区参数：模式、打印格式、输出目录），存 settings.ui 与 settings.exportPrefs，localStorage+磁盘双写。rev69：+ 真实报表解析（无「行次」列、Excel 序列号日期、科目编码列、左右并排）+ python 按能力挑解释器（.xls 要 xlrd）+ AI 兜底解析（/project/finance/ai-parse，规则认不出的页交给模型读）。rev68：+ 财务报表文件夹批量导入（/project/finance/scan + finance_scan.py）。上一轮：+ 修复增删行规划阶段平方级退化：_print_bounds 把 range_boundaries 的第4个返回值(max_row)当成了 max_col，导致 _block_ok 对 3716 列调用 ws.cell 凭空造格、occupied 每行扫全部单元格；祥生明细表规划 620 秒→0.02 秒，整条链路 10分47秒→9.9秒，19 处变更与修复前一致；+ 加包名漂移自检：Loading 名与 package.json name 不一致会让宿主 nearestPackage 跳过 client bundle（侧栏消失但路由正常），apply 启动时扫各 profile 依赖并告警
+  const REV = 'rev71-finance-allocation'; // rev71：+ 未分配财务资料一键分配到公司夹（finance-allocation.js：持久数据校验绑定、逐级 mkdir 防符号链接、finance_multi_scan.py 多公司批量扫描）+ 公司夹归属校验（company-folder-ownership.js）+ 对话直连天源财报/底稿导入。rev70：+ 界面状态持久化（记住上次所在页签/子页/打开的项目/导出工作区参数：模式、打印格式、输出目录），存 settings.ui 与 settings.exportPrefs，localStorage+磁盘双写。rev69：+ 真实报表解析（无「行次」列、Excel 序列号日期、科目编码列、左右并排）+ python 按能力挑解释器（.xls 要 xlrd）+ AI 兜底解析（/project/finance/ai-parse，规则认不出的页交给模型读）。rev68：+ 财务报表文件夹批量导入（/project/finance/scan + finance_scan.py）。上一轮：+ 修复增删行规划阶段平方级退化：_print_bounds 把 range_boundaries 的第4个返回值(max_row)当成了 max_col，导致 _block_ok 对 3716 列调用 ws.cell 凭空造格、occupied 每行扫全部单元格；祥生明细表规划 620 秒→0.02 秒，整条链路 10分47秒→9.9秒，19 处变更与修复前一致；+ 加包名漂移自检：Loading 名与 package.json name 不一致会让宿主 nearestPackage 跳过 client bundle（侧栏消失但路由正常），apply 启动时扫各 profile 依赖并告警
   // 自检：Loader 引用名必须与 package.json 的 name 逐字相等。
   // 宿主的 dsh-client-modules 在 locatePkgJson → nearestPackage 里用
   // `name === expectedPackageName` 认领包，不一致就返回 undefined → resolveMeta
@@ -4485,27 +4646,11 @@ export function apply(ctx) {
       path: PREFIX + '/project/finance/scan', methods: ['POST'], fetch: async (req) => {
         try {
           const b = await req.json().catch(() => ({}));
-          const folder = safeFolderName(b.folder || '');
-          const absBound = String(b.abs || '').trim();
-          if (!folder && !absBound) return json({ ok: false, error: '项目文件夹名不合法（先填项目编号与项目简称）' }, 400);
-          // 公司名是路径的一段：按文件夹名校验（拒绝 .. 与分隔符），别让扫描跑出 00财务资料 之外。
-          // 前端传的是 segSafe 过的名字，正常不会带这些字符；带了就是调用方有问题，直接拒。
-          const company = safeFolderName(b.company || '');
-          if (!company) return json({ ok: false, error: '缺少公司名称（或名称里有 / \\ 这类不能做目录名的字符）' }, 400);
-          let base = absBound ? await store.describeFolder(absBound, false) : null;
-          if (absBound && (!base || base.ok === false)) {
-            return json({ ok: false, error: (base && base.error) || ('项目文件夹不可用：' + absBound) }, 400);
+          const { dir: target, parts } = await boundFinanceStatementDir(b, true);
+          for (const ent of await readdir(target, { withFileTypes: true })) {
+            if (ent.isSymbolicLink()) throw new Error('报表目录包含符号链接，已阻止扫描');
           }
-          if (!base || base.ok === false) {
-            base = folder ? await store.findProjectDir(folder) : null;
-            if (base && base.ok === false) base = null;
-          }
-          if (!base) return json({ ok: false, error: '项目文件夹不存在：' + (absBound || folder) }, 400);
-          // 与 folders.js 的 FIN_STATEMENT_DIR 保持一致：公司夹下固定一层
-          const parts = ['02现场资料', '企业提供资料', '00财务资料', company, FIN_STATEMENT_DIR];
-          const target = join(base.path, ...parts);
-          await mkdir(target, { recursive: true });
-          const extra = [];
+          const extra = ['--include-comparatives', '1'];
           const basedate = String(b.basedate || '').replace(/[^0-9-]/g, '').slice(0, 10);
           if (basedate) extra.push('--basedate', basedate);
           const force = b.force && typeof b.force === 'object' ? b.force : null;
@@ -4525,6 +4670,195 @@ export function apply(ctx) {
       },
     },
     {
+      // 查询只读：公司名单取服务端持久数据，目录候选不会自动认领。
+      path: PREFIX + '/project/finance/unallocated-ownership', methods: ['POST'], fetch: async (req) => {
+        try {
+          const b = await req.json().catch(() => ({}));
+          const { root, state } = await unallocatedRoot(b.abs, b.projectId);
+          const rows = unallocatedCompanyRows(state, b.projectId);
+          const result = await inspectCompanyFolders({ projectRoot: root, projectId: String(b.projectId), companies: rows.map(c => ({ companyId: c.id, name: c.name })) });
+          return json({ ok: true, rows: result.rows, folders: await unallocatedFolderCandidates(root) });
+        } catch (e) { return json({ ok: false, error: String((e && e.message) || e).slice(0, 300) }, 400); }
+      },
+    },
+    {
+      // 每次只绑定一家公司；名称只来自可信项目，目录必须已存在。
+      path: PREFIX + '/project/finance/unallocated-bind', methods: ['POST'], fetch: async (req) => {
+        try {
+          const b = await req.json().catch(() => ({}));
+          const { root, state } = await unallocatedRoot(b.abs, b.projectId);
+          const id = String(b.companyId == null ? '' : b.companyId);
+          const list = state.work && state.work.equity && state.work.equity[String(b.projectId)] && state.work.equity[String(b.projectId)].companies;
+          if (!Array.isArray(list) || list.filter(c => c && String(c.id) === id).length !== 1) throw new Error('公司不属于该项目或公司 ID 不唯一');
+          const company = unallocatedCompanyRows(state, b.projectId).find(c => c.id === id);
+          if (!company) throw new Error('公司不属于该项目或名称无效');
+          const binding = await bindCompanyFolder({ projectRoot: root, projectId: String(b.projectId), companyId: id, name: company.name, folder: b.folder, confirmText: b.confirmText });
+          return json({ ok: true, binding });
+        } catch (e) { return json({ ok: false, error: String((e && e.message) || e).slice(0, 300) }, 400); }
+      },
+    },
+    {
+      // 旧清单或目录替换后，人工确认当前目录身份；不移动文件。
+      path: PREFIX + '/project/finance/unallocated-confirm-folder-identity', methods: ['POST'], fetch: async (req) => {
+        try {
+          const b = await req.json().catch(() => ({}));
+          const { root, state } = await unallocatedRoot(b.abs, b.projectId);
+          const id = String(b.companyId == null ? '' : b.companyId);
+          const list = state.work && state.work.equity && state.work.equity[String(b.projectId)] && state.work.equity[String(b.projectId)].companies;
+          if (!Array.isArray(list) || list.filter(c => c && String(c.id) === id).length !== 1) throw new Error('公司不属于该项目或公司 ID 不唯一');
+          const company = unallocatedCompanyRows(state, b.projectId).find(c => c.id === id);
+          if (!company || b.currentName !== company.name) throw new Error('公司当前名称不匹配，请重新查询');
+          const binding = await confirmCompanyFolderIdentity({ projectRoot: root, projectId: String(b.projectId), companyId: id, expectedName: b.expectedName, folder: b.folder, confirmText: b.confirmText });
+          return json({ ok: true, binding });
+        } catch (e) { return json({ ok: false, error: String((e && e.message) || e).slice(0, 300) }, 400); }
+      },
+    },
+    {
+      // 仅原目录确实缺失时，人工确认重绑另一已有目录；不移动文件。
+      path: PREFIX + '/project/finance/unallocated-rebind-missing', methods: ['POST'], fetch: async (req) => {
+        try {
+          const b = await req.json().catch(() => ({}));
+          const { root, state } = await unallocatedRoot(b.abs, b.projectId);
+          const id = String(b.companyId == null ? '' : b.companyId);
+          const list = state.work && state.work.equity && state.work.equity[String(b.projectId)] && state.work.equity[String(b.projectId)].companies;
+          if (!Array.isArray(list) || list.filter(c => c && String(c.id) === id).length !== 1) throw new Error('公司不属于该项目或公司 ID 不唯一');
+          const company = unallocatedCompanyRows(state, b.projectId).find(c => c.id === id);
+          if (!company) throw new Error('公司不属于该项目或名称无效');
+          const binding = await rebindMissingCompanyFolder({ projectRoot: root, projectId: String(b.projectId), companyId: id, name: company.name, previousFolder: b.previousFolder, folder: b.folder, confirmText: b.confirmText });
+          return json({ ok: true, binding });
+        } catch (e) { return json({ ok: false, error: String((e && e.message) || e).slice(0, 300) }, 400); }
+      },
+    },
+    {
+      // 名称变更需人工核对旧名称、新名称和同一目录，不允许借此更改目录。
+      path: PREFIX + '/project/finance/unallocated-reconfirm-name', methods: ['POST'], fetch: async (req) => {
+        try {
+          const b = await req.json().catch(() => ({}));
+          const { root, state } = await unallocatedRoot(b.abs, b.projectId);
+          const id = String(b.companyId == null ? '' : b.companyId);
+          const list = state.work && state.work.equity && state.work.equity[String(b.projectId)] && state.work.equity[String(b.projectId)].companies;
+          if (!Array.isArray(list) || list.filter(c => c && String(c.id) === id).length !== 1) throw new Error('公司不属于该项目或公司 ID 不唯一');
+          const company = unallocatedCompanyRows(state, b.projectId).find(c => c.id === id);
+          if (!company || b.currentName !== company.name) throw new Error('公司当前名称不匹配，请重新查询');
+          const binding = await reconfirmCompanyFolderName({ projectRoot: root, projectId: String(b.projectId), companyId: id, currentName: company.name, expectedName: b.expectedName, folder: b.folder, confirmText: b.confirmText });
+          return json({ ok: true, binding });
+        } catch (e) { return json({ ok: false, error: String((e && e.message) || e).slice(0, 300) }, 400); }
+      },
+    },
+    {
+      // 未分配财务资料四路由：init / scan / preview / apply。
+      // 安全原则：目录一律从绑定 abs 推导；公司目录名一律由后端从可信项目数据映射；
+      // 文件快照一律来自后端现扫；前端传的 company/category 只用于对账，不直接采用。
+      path: PREFIX + '/project/finance/unallocated-init', methods: ['POST'], fetch: async (req) => {
+        try {
+          const b = await req.json().catch(() => ({}));
+          const { root } = await unallocatedRoot(b.abs, b.projectId);
+          const dir = unallocatedSourceDir(root);
+          let created = false;
+          try { await lstat(dir); } catch (e) { if (e.code !== 'ENOENT') throw e; created = true; }
+          if (created) await initUnallocatedDir(root);
+          else {
+            const info = await lstat(dir);
+            if (info.isSymbolicLink() || !info.isDirectory()) throw new Error('未分配资料路径含符号链接或不是目录：' + dir);
+          }
+          return json({ ok: true, dir, created });
+        } catch (e) {
+          return json({ ok: false, error: String((e && e.message) || e).slice(0, 300) }, 400);
+        }
+      },
+    },
+    {
+      path: PREFIX + '/project/finance/unallocated-scan', methods: ['POST'], fetch: async (req) => {
+        try {
+          const b = await req.json().catch(() => ({}));
+          const { root, state } = await unallocatedRoot(b.abs, b.projectId);
+          const rows = unallocatedCompanyRows(state, b.projectId);
+          const dir = unallocatedSourceDir(root);
+          // 项目根与未分配目录逐级 lstat：拒绝目录链接，不做字符串前缀检查。
+          let target = root;
+          const parts = ['02现场资料', '企业提供资料', '00财务资料', '00未分配财务资料'];
+          for (const part of [null, ...parts]) {
+            if (part) target = join(target, part);
+            const info = await lstat(target);
+            if (info.isSymbolicLink() || !info.isDirectory()) return json({ ok: false, error: '未分配资料路径含符号链接或不是目录：' + target }, 400);
+          }
+          const rootReal = await realpath(root);
+          const targetReal = await realpath(target);
+          const rel = relative(rootReal, targetReal);
+          if (!rel || rel === '..' || rel.startsWith('..' + sep) || isAbsolute(rel)) return json({ ok: false, error: '未分配资料目录超出项目根目录' }, 400);
+          const snap = await scanFinanceAllocation({ projectRoot: rootReal });
+          // 识别（公司/类别建议）交给 finance_multi_scan.py；快照（size/hash/dev/ino）来自本地现扫。
+          const script = fileURLToPath(new URL('./finance_multi_scan.py', import.meta.url));
+          const args = [targetReal, '--companies', JSON.stringify(rows)];
+          let lastErr = null;
+          for (const py of await orderedPythons(needForArgs(args))) {
+            try {
+              const r = await runCli(py, [script, ...args], 180000, { PYTHONDONTWRITEBYTECODE: '1' });
+              if (r.code !== 0) { lastErr = new Error((r.stderr || '').slice(0, 300) || ('python 退出码 ' + r.code)); continue; }
+              const result = parseFirstJson(r.stdout);
+              if (!result || typeof result !== 'object' || Array.isArray(result)) { lastErr = new Error('未分配资料扫描脚本输出无法解析'); continue; }
+              const byName = {};
+              snap.files.forEach(f => { if (f && f.name && !f.error) byName[f.name] = f; });
+              const files = (Array.isArray(result.files) ? result.files : []).map(f => {
+                const s = byName[f && f.name];
+                return s ? Object.assign({}, f, { size: s.size, hash: s.hash, dev: String(s.dev), ino: String(s.ino) }) : f;
+              });
+              return json({ ok: true, dir: targetReal, files, limits: result.limits || null, summary: result.summary || null, companies: rows });
+            } catch (e) { lastErr = e; }
+          }
+          throw lastErr || new Error('没有可用的 python（需要 openpyxl）');
+        } catch (e) {
+          return json({ ok: false, error: String((e && e.message) || e).slice(0, 300) }, 400);
+        }
+      },
+    },
+    {
+      path: PREFIX + '/project/finance/unallocated-preview', methods: ['POST'], fetch: async (req) => {
+        try {
+          const b = await req.json().catch(() => ({}));
+          const { root, state } = await unallocatedRoot(b.abs, b.projectId);
+          const rows = unallocatedCompanyRows(state, b.projectId);
+          const dirs = await unallocatedCompanyDirs(root, b.projectId, rows);
+          const snap = await scanFinanceAllocation({ projectRoot: root });
+          const items = [];
+          const errors = [];
+          for (const it of (Array.isArray(b.items) ? b.items : [])) {
+            try {
+              const sel = unallocatedMapItem(it, snap, dirs);
+              const r = await resolveFinanceAllocation({ projectRoot: root, companyFolders: dirs.folders, selections: [sel] });
+              const x = r.items[0];
+              items.push({ name: sel.name, sourceHash: sel.sourceHash, companyId: sel.companyId, category: sel.category, destination: x.destination, error: '' });
+            } catch (e) {
+              const msg = String((e && e.message) || e).slice(0, 200);
+              const name = it && it.name ? it.name : '(未知文件)';
+              errors.push(name + '：' + msg);
+              items.push({ name: (it && it.name) || '', sourceHash: (it && it.sourceHash) || '', companyId: (it && it.companyId) || '', category: (it && it.category) || '', error: msg });
+            }
+          }
+          return json({ ok: errors.length === 0, items, errors }, 200);
+        } catch (e) {
+          return json({ ok: false, error: String((e && e.message) || e).slice(0, 300), items: [], errors: [String((e && e.message) || e).slice(0, 300)] }, 400);
+        }
+      },
+    },
+    {
+      path: PREFIX + '/project/finance/unallocated-apply', methods: ['POST'], fetch: async (req) => {
+        try {
+          const b = await req.json().catch(() => ({}));
+          if (b.confirmText !== '确认分配财务资料') return json({ ok: false, error: '缺少明确确认文本，已阻止执行' }, 400);
+          const { root, state } = await unallocatedRoot(b.abs, b.projectId);
+          const rows = unallocatedCompanyRows(state, b.projectId);
+          const dirs = await unallocatedCompanyDirs(root, b.projectId, rows);
+          const snap = await scanFinanceAllocation({ projectRoot: root });
+          const selections = unallocatedSelections(b.items, snap, dirs); // 任一项映射失败整批阻止
+          const r = await copyFinanceAllocation({ projectRoot: root, companyFolders: dirs.folders, selections });
+          return json({ ok: r.results.every(x => x.success), results: r.results });
+        } catch (e) {
+          return json({ ok: false, error: String((e && e.message) || e).slice(0, 300) }, 400);
+        }
+      },
+    },
+    {
       // AI 兜底解析：POST /project/finance/ai-parse { folder, abs, company, targets:[{fileName,sheet}], basedate }
       // 规则（finance_scan.py）认不出的页，把单元格原样丢给模型读一遍，再按同一套
       // ty_map 落成天源科目。只处理调用方点名的页，不做全目录扫描——
@@ -4532,21 +4866,7 @@ export function apply(ctx) {
       path: PREFIX + '/project/finance/ai-parse', methods: ['POST'], fetch: async (req) => {
         try {
           const b = await req.json().catch(() => ({}));
-          const folder = safeFolderName(b.folder || '');
-          const absBound = String(b.abs || '').trim();
-          const company = safeFolderName(b.company || '');
-          if (!company) return json({ ok: false, error: '缺少公司名称' }, 400);
-          let base = absBound ? await store.describeFolder(absBound, false) : null;
-          if (absBound && (!base || base.ok === false)) {
-            return json({ ok: false, error: (base && base.error) || ('项目文件夹不可用：' + absBound) }, 400);
-          }
-          if (!base || base.ok === false) {
-            base = folder ? await store.findProjectDir(folder) : null;
-            if (base && base.ok === false) base = null;
-          }
-          if (!base) return json({ ok: false, error: '项目文件夹不存在' }, 400);
-          const parts = ['02现场资料', '企业提供资料', '00财务资料', company, FIN_STATEMENT_DIR];
-          const dir = join(base.path, ...parts);
+          const { dir, parts } = await boundFinanceStatementDir(b, false);
           const basedate = String(b.basedate || '').replace(/[^0-9-]/g, '').slice(0, 10);
           const targets = Array.isArray(b.targets) ? b.targets.slice(0, 12) : [];
           if (!targets.length) return json({ ok: false, error: '没有指定要 AI 读的页' }, 400);
@@ -4564,8 +4884,9 @@ export function apply(ctx) {
             const sheet = String(t.sheet || '').trim();
             if (!fileName) { errors.push({ fileName: t.fileName, sheet, error: '文件名不合法' }); continue; }
             const full = join(dir, fileName);
-            if (!existsSync(full)) { errors.push({ fileName, sheet, error: '文件不存在' }); continue; }
             try {
+              const fileStat = await lstat(full);
+              if (fileStat.isSymbolicLink() || !fileStat.isFile()) throw new Error('报表不是安全的普通文件');
               const dumped = await financeDumpCells(py, full, sheet, 200);
               const one = (dumped.sheets || [])[0];
               if (!one) { errors.push({ fileName, sheet, error: '这一页是空的' }); continue; }

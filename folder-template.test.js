@@ -9,7 +9,7 @@ import assert from 'node:assert/strict';
 import { mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { STATIC_DIRS, MGMT_FOLDER, MGMT_CATEGORIES } from './folders.js';
+import { STATIC_DIRS, MGMT_FOLDER, MGMT_CATEGORIES, planProjectFolders } from './folders.js';
 import {
   DEFAULT_FOLDER_TEMPLATE, treeToPaths, folderTemplatePlan, validateFolderTemplate,
   folderTemplateRequest,
@@ -77,6 +77,19 @@ test('公司段按方法与金额生成', () => {
   assert.ok(own2.includes('02现场资料/企业提供资料/03资产基础法/测试公司/12固定资产/01房屋建筑物和构筑物/其他'), '明细配其他');
   assert.ok(own.includes('02现场资料/企业提供资料/04收益法/测试公司/07折现率'));
   assert.ok(!own.some(p => p.includes('05市场法/测试公司')), '没选市场法不应建');
+});
+
+test('目录命名冲突不静默合并公司', () => {
+  const examples = [
+    ['甲', '甲', '甲(2)'],
+    ['ABC', 'abc'],
+    ['00未分配财务资料'],
+  ];
+  for (const names of examples) {
+    const companies = names.map(name => ({ name }));
+    assert.throws(() => folderTemplatePlan(DEFAULT_FOLDER_TEMPLATE, companies), /目录名称冲突/);
+    assert.throws(() => planProjectFolders({ companies }), /目录名称冲突/);
+  }
 });
 
 test('校验拒绝非法模板', () => {

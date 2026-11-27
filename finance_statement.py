@@ -375,6 +375,7 @@ def parse_sheet(rows, sheet_name, year_hint='', force_kind=None):
     above = rows[:head['row'] + 1]
     unit = find_unit(above)
     period = find_period(above)
+    period_explicit = bool(period)
     if not period and year_hint:
         period = (str(year_hint) + '年度') if kind == 'income' else (str(year_hint) + '年12月31日')
     year = ''
@@ -409,8 +410,11 @@ def parse_sheet(rows, sheet_name, year_hint='', force_kind=None):
     sides = BALANCE_SIDES if kind == 'balance' else None
     tpl = capture_template(kind, rows_out, sides)
     tpl, extra = match_template(kind, rows_out, tpl)
+    comparison_columns_safe = (len(head['groups']) == 1 and
+                               [a['kind'] for a in head['groups'][0]['amounts']] == ['now', 'prev'])
     return {'statement': kind, 'sheet': sheet_name, 'year': year, 'unit': unit,
-            'period': period, 'columns': columns, 'rows': rows_out,
+            'period': period, 'periodExplicit': period_explicit,
+            'comparisonColumnsSafe': comparison_columns_safe, 'columns': columns, 'rows': rows_out,
             'template': tpl, 'extra': extra}
 
 
@@ -778,9 +782,11 @@ def _q(s):
     bare = re.sub(r'\([^()]*填列[^()]*\)|\([^()]*号[^()]*\)', '', t).replace(' ', '')
     if bare and bare != t:
         out.append(bare)
-    for pre in ('一、', '二、', '三、', '四、', '五、', '六、', '七、', '八、', '减:', '加:', '其中:'):
-        if t.startswith(pre):
-            out.append(t[len(pre):])
+    # 前缀和括号说明可能同时存在，需要对去括号后的名称继续去前缀。
+    for value in list(out):
+        for pre in ('一、', '二、', '三、', '四、', '五、', '六、', '七、', '八、', '减:', '加:', '其中:'):
+            if value.startswith(pre):
+                out.append(value[len(pre):])
     return out
 
 
@@ -860,6 +866,25 @@ def build_sheet(kind, tpl_rows, report_year, source_sheet, audit=None):
             continue
         seen_target[target] = name
         detail.append({'subjectName': target, 'amount': round(float(amount), 2), 'originName': name})
+    # 仅有营业收入/成本总额且没有对应的主营、其他细分行时暂填主营，
+    # 不将包含其他费用的“营业总成本”等同于营业成本。即使细分行金额为空也不推断。
+    if kind == 'income':
+        for total, main, other in (('营业收入', '主营业务收入', '其他业务收入'),
+                                   ('营业成本', '主营业务成本', '其他业务成本')):
+            if any(ty_map(kind, row['name']) in (main, other) for row in tpl_rows):
+                continue
+            for row in tpl_rows:
+                values = row.get('values') or []
+                if total in _q(row['name']) and values and values[0] is not None:
+                    detail.append({'subjectName': main, 'amount': round(float(values[0]), 2),
+                                   'originName': row['name'] + '（源表%s总额暂填，待核对主营及其他业务细分）' % total})
+                    break
+    # 天源另设“净利润报表数”用于与其计算结果勾稽；源表只有净利润时，
+    # 使用源表净利润（非天源计算值）并保留来源，显式报表数优先。
+    if kind == 'income' and '净利润报表数' not in seen_target:
+        net = next ( (x for x in detail if x['subjectName'] == '净利润'), None )
+        if net is not None:
+            detail.append({'subjectName': '净利润报表数', 'amount': net['amount'], 'originName': net['originName'] + '（源表净利润）'})
     order = {x['subjectName']: i for i, x in enumerate(ty_template(kind)) if not x['title']}
     detail.sort(key=lambda x: order.get(x['subjectName'], 999))
     sheet = {'reportYear': int(report_year), 'sourceSheetName': source_sheet, 'detail': detail,

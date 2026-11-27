@@ -95,6 +95,9 @@ def pack_of(st, year, file_name):
         'statementTypeName': KIND_NAMES.get(st['statement'], ''),
         'year': int(year),
         'period': st['period'],
+        'originalPeriod': st['period'] if st.get('periodExplicit') else '',
+        'periodExplicit': st.get('periodExplicit', False),
+        'comparisonColumnsSafe': st.get('comparisonColumnsSafe', False),
         'unit': st.get('unit') or '',
         'fileName': file_name,
         'sheet': st['sheet'],
@@ -252,7 +255,8 @@ def fix_years(packs):
         if ny and str(p['year']) != ny:
             notes.append({
                 'statementType': p['statementType'], 'fileName': p['fileName'],
-                'from': p['year'], 'to': int(ny), 'why': '文件名里的年份与表头不一致，按文件名',
+                'from': p['year'], 'to': int(ny), 'why': '文件名里的年份与识别年度不一致，按文件名',
+                'originalPeriod': p.get('originalPeriod') or '', 'requiresConfirmation': True,
             })
             p['year'] = int(ny)
             # 期间列表头原文里也带着错年份，跟着改，免得「年度 2024 / 期间 2023年12月31日」
@@ -261,8 +265,20 @@ def fix_years(packs):
             sd = p.get('sheetData')
             if isinstance(sd, dict):
                 sd['reportYear'] = int(ny)
-    # 2. 至此如果还有同类型同期冲突（文件名没有年份的），用对账关系区分
-    #    同一份报表的「上年」序列应当等于另一年份那份的「本期」序列。
+    # 保留原表期间和冲突证据，供客户端单独提示年度待确认，不混入待分类队列。
+    for p in packs:
+        original = p.get('originalPeriod') or ''
+        match = re.search(r'(19|20)\d{2}', original)
+        if not match or int(match.group()) == p['year']:
+            continue
+        note = next((n for n in notes if n['statementType'] == p['statementType'] and
+                     n['fileName'] == p['fileName']), None)
+        if note is None:
+            note = {'statementType': p['statementType'], 'fileName': p['fileName'],
+                    'from': int(match.group()), 'to': p['year'], 'why': '原表期间与识别年度不一致'}
+            notes.append(note)
+        note['originalPeriod'] = original
+        note['requiresConfirmation'] = True
     return packs, notes
 
 
@@ -332,6 +348,49 @@ def main():
                 'kept': kept[k]['fileName'], 'dropped': p['fileName'],
             })
         kept[k] = p
+    # 仅年报的比较列可作为上一年度候选；独立年报优先，候选需人工勾选。
+    for p in (list(kept.values()) if opts.get('include-comparatives', '1') == '1' else []):
+        kind = p['statementType']
+        period = str(p.get('period') or '')
+        cols = p.get('columns') or []
+        period_year = re.search(r'(19|20)\d{2}', period)
+        year_changed = any(n['statementType'] == kind and n['fileName'] == p['fileName'] for n in yearNotes)
+        original_year = re.search(r'(19|20)\d{2}', p.get('originalPeriod') or '')
+        year_safe = (not year_changed and period_year and int(period_year.group()) == p['year'] and
+                     original_year and int(original_year.group()) == p['year'])
+        if kind == 'balance_sheet':
+            # 只允许明确年末日期、单区块且金额列严格按本期/上期排列。
+            annual = (p.get('periodExplicit') and p.get('comparisonColumnsSafe') and year_safe and
+                      bool(re.search(r'12\s*月\s*31\s*日|12[-/.]31', period)))
+            previous_label = r'期初|年初|上年年末'
+            source = '年报期初（上一年年末）'
+            sheet_kind = 'balance'
+        elif kind == 'income_statement':
+            # 不将季度/半年利润表的上期误认为完整上一年度。
+            annual = (p.get('periodExplicit') and p.get('comparisonColumnsSafe') and year_safe and
+                      bool(re.search(r'年度|全年|1\s*[-–至—]\s*12\s*月', period)) and
+                      not re.search(r'季度|半年|[一二三四]季', period))
+            previous_label = r'上年同期|上年累计|上期金额|上期数|上年金额'
+            source = '年报上年同期（上一年度候选）'
+            sheet_kind = 'income'
+        else:
+            continue
+        if not annual or not any(c.get('kind') == 'prev' and re.search(previous_label, str(c.get('label') or '')) for c in cols):
+            continue
+        key = (kind, p['year'] - 1)
+        if key in kept:
+            continue
+        rows = p.get('rows') or []
+        prior = [dict(r, values=[(r.get('values') or [None, None])[1] if len(r.get('values') or []) > 1 else None]) for r in rows]
+        if not any((r.get('values') or [None])[0] is not None for r in prior):
+            continue
+        sd = fs.explained_skip(sheet_kind, fs.build_sheet(sheet_kind, prior, p['year'] - 1, p['sheet']))
+        if not sd['detail']:
+            continue
+        comparison_col = next(c for c in cols if c.get('kind') == 'prev' and re.search(previous_label, str(c.get('label') or '')))
+        kept[key] = dict(p, year=p['year'] - 1, period=str(p['year']) + source,
+                         columns=[{'kind': 'now', 'label': comparison_col.get('label') or ''}],
+                         rows=prior, sheetData=sd, comparisonSource=True)
     final = sorted(kept.values(), key=lambda x: (x['statementType'], x['year']))
 
     print(json.dumps({

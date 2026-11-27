@@ -3010,7 +3010,254 @@ window.__ModuleLoader__.load({
             : h('button', { type: 'button', className: 'pf-btn pri', onClick: parse, disabled: busy }, busy ? '解析中…' : '确定')));
     }
 
-    function EquityPanel({ project, s, toast, openSub, onOpenCo }) {
+    // 项目级未分配资料：只复制到公司目录，不解析报表、不操作天源。
+    function UnallocatedFinance({ project, rows, toast, openSub }) {
+      const categories = ['01财务报表', '02审计报告', '02科目余额表', '03辅助余额表', '04序时账'];
+      const [data, setData] = useState(null);
+      const [choices, setChoices] = useState({});
+      const [preview, setPreview] = useState(null);
+      const [results, setResults] = useState(null);
+      const [ownership, setOwnership] = useState(null);
+      const [folderChoices, setFolderChoices] = useState({});
+      const [pending, setPending] = useState(false);
+      const [inited, setInited] = useState(false);
+      const [busy, setBusy] = useState('');
+      const busyRef = useRef(false);
+      const alive = useRef(true);
+      const context = useRef(null);
+      context.current = { id: String(project.id), abs: projectAbs(project) };
+      useEffect(() => { setInited(false); setOwnership(null); setFolderChoices({}); }, [project.id, context.current.abs]);
+      const companies = () => eqRows(eqListOf(store.get(), project.id)).map(r => ({ id: String(r.id), name: String(r.name || '') }));
+      useEffect(() => { alive.current = true; return () => { alive.current = false; }; }, []);
+      useEffect(() => {
+        if (!pending) return;
+        const warn = e => { e.preventDefault(); e.returnValue = ''; };
+        window.addEventListener('beforeunload', warn);
+        return () => window.removeEventListener('beforeunload', warn);
+      }, [pending]);
+      const post = async (route, body, allowError) => {
+        if (!projectAbs(project) || body.abs !== projectAbs(project)) throw new Error('项目尚未绑定真实目录，请先绑定项目文件夹');
+        const r = await fetch(PREFIX + '/project/finance/' + route, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(Object.assign({}, body, { projectId: String(project.id) })) });
+        const d = await r.json().catch(() => ({}));
+        if (r.status === 404) throw new Error('接口不可用，请重启宿主后重试');
+        if ((!r.ok || !d.ok) && !allowError) throw new Error(d.error || ('HTTP ' + r.status));
+        if (!r.ok && !Array.isArray(d.results) && !Array.isArray(d.items)) throw new Error(d.error || ('HTTP ' + r.status));
+        return d;
+      };
+      const run = async (label, fn) => {
+        if (busyRef.current) return;
+        busyRef.current = true; setBusy(label);
+        try { await fn(); } catch (e) { if (alive.current) toast('未分配资料操作失败：' + String(e.message || e), 'warn'); }
+        finally { busyRef.current = false; if (alive.current) setBusy(''); }
+      };
+      const currentContext = () => ({ id: String(project.id), abs: projectAbs(project) });
+      const checkContext = (snapshot, cs) => {
+        if (!alive.current || JSON.stringify(snapshot) !== JSON.stringify(context.current) || JSON.stringify(cs) !== JSON.stringify(companies())) throw new Error('项目或公司名单发生变化，请重新扫描');
+      };
+      const readOwnership = async (snapshot, cs) => {
+        const d = await post('unallocated-ownership', { abs: snapshot.abs });
+        checkContext(snapshot, cs);
+        if (!Array.isArray(d.rows) || !Array.isArray(d.folders) || d.folders.some(x => typeof x !== 'string')) throw new Error('目录归属响应不完整');
+        setOwnership({ rows: d.rows, folders: d.folders, context: snapshot, companies: cs });
+        setFolderChoices({});
+      };
+      const loadOwnership = () => run('ownership', async () => {
+        setPreview(null); setOwnership(null);
+        const snapshot = currentContext(), cs = companies();
+        await readOwnership(snapshot, cs);
+      });
+      const bindOwnership = row => run('bind', async () => {
+        setPreview(null);
+        const snapshot = currentContext(), cs = companies();
+        if (!ownership || JSON.stringify(ownership.context) !== JSON.stringify(snapshot) || JSON.stringify(ownership.companies) !== JSON.stringify(cs)) throw new Error('项目或公司名单已变化，请重新读取归属');
+        const folder = folderChoices[String(row.companyId)];
+        if (!folder || !ownership.folders.includes(folder)) throw new Error('请明确选择已有目录');
+        const sep = snapshot.abs.includes('\\') ? '\\' : '/';
+        const target = snapshot.abs.replace(/[\\\\/]+$/, '') + sep + ['02现场资料', '企业提供资料', '00财务资料', folder].join(sep);
+        if (!window.confirm('确认将以下已有目录绑定给该公司？不会复制或移动文件。\n公司：' + row.name + '\n目录：' + target)) return;
+        checkContext(snapshot, cs);
+        setOwnership(null); setFolderChoices({});
+        try {
+          await post('unallocated-bind', { abs: snapshot.abs, companyId: String(row.companyId), folder, confirmText: '确认绑定公司目录' });
+        } finally {
+          if (alive.current && JSON.stringify(snapshot) === JSON.stringify(context.current)) await readOwnership(snapshot, cs);
+        }
+      });
+      const confirmOwnershipRename = row => run('confirm-rename', async () => {
+        setPreview(null);
+        const snapshot = currentContext(), cs = companies();
+        if (!ownership || JSON.stringify(ownership.context) !== JSON.stringify(snapshot) || JSON.stringify(ownership.companies) !== JSON.stringify(cs)) throw new Error('项目或公司名单已变化，请重新读取归属');
+        if (row.status !== 'name_changed' || !row.folder || !row.recordedName || !row.name) throw new Error('更名信息不完整，请重新读取归属');
+        const sep = snapshot.abs.includes('\\') ? '\\' : '/';
+        const target = snapshot.abs.replace(/[\\/]+$/, '') + sep + ['02现场资料', '企业提供资料', '00财务资料', row.folder].join(sep);
+        if (!window.confirm('确认这是同一家公司更名，原目录归属不变？不会重命名目录或搬迁文件。\n原名称：' + row.recordedName + '\n新名称：' + row.name + '\n现有目录：' + target)) return;
+        checkContext(snapshot, cs);
+        setOwnership(null); setFolderChoices({});
+        try {
+          await post('unallocated-reconfirm-name', { abs: snapshot.abs, companyId: String(row.companyId), folder: row.folder, expectedName: row.recordedName, currentName: row.name, confirmText: '确认更新公司目录归属名称' });
+        } finally {
+          if (alive.current && JSON.stringify(snapshot) === JSON.stringify(context.current)) await readOwnership(snapshot, cs);
+        }
+      });
+      const confirmFolderIdentity = row => run('confirm-folder-identity', async () => {
+        setPreview(null);
+        const snapshot = currentContext(), cs = companies();
+        if (!ownership || JSON.stringify(ownership.context) !== JSON.stringify(snapshot) || JSON.stringify(ownership.companies) !== JSON.stringify(cs)) throw new Error('项目或公司名单已变化，请重新读取归属');
+        if (!['identity_unverified', 'folder_changed'].includes(row.status) || !row.folder || !row.recordedName || !row.name) throw new Error('目录身份信息不完整，请重新读取归属');
+        const sep = snapshot.abs.includes('\\') ? '\\' : '/';
+        const target = snapshot.abs.replace(/[\\/]+$/, '') + sep + ['02现场资料', '企业提供资料', '00财务资料', row.folder].join(sep);
+        if (!window.confirm('目录身份无法自动证明，旧文件可能不属于该公司。请先核实目录内容与公司身份。确认只更新目录身份指纹，不会移动文件。\n公司：' + row.name + '\n清单记录名称：' + row.recordedName + '\n完整目录：' + target + (row.recordedName !== row.name ? '\n公司名称也已变更；确认身份后仍需另行确认更名。' : ''))) return;
+        checkContext(snapshot, cs);
+        setOwnership(null); setFolderChoices({});
+        try {
+          await post('unallocated-confirm-folder-identity', { abs: snapshot.abs, companyId: String(row.companyId), folder: row.folder, expectedName: row.recordedName, currentName: row.name, confirmText: '确认该公司目录身份' });
+        } finally {
+          if (alive.current && JSON.stringify(snapshot) === JSON.stringify(context.current)) await readOwnership(snapshot, cs);
+        }
+      });
+      const rebindMissingOwnership = row => run('rebind-missing', async () => {
+        setPreview(null);
+        const snapshot = currentContext(), cs = companies();
+        if (!ownership || JSON.stringify(ownership.context) !== JSON.stringify(snapshot) || JSON.stringify(ownership.companies) !== JSON.stringify(cs)) throw new Error('项目或公司名单已变化，请重新读取归属');
+        const folder = folderChoices[String(row.companyId)];
+        if (row.status !== 'folder_missing' || !row.folder || !folder || !ownership.folders.includes(folder)) throw new Error('请明确选择已有目录');
+        if (row.recordedName !== row.name) throw new Error('公司名称同时发生变化，请先核实身份后处理');
+        const sep = snapshot.abs.includes('\\') ? '\\' : '/';
+        const base = snapshot.abs.replace(/[\\/]+$/, '') + sep + ['02现场资料', '企业提供资料', '00财务资料'].join(sep) + sep;
+        if (!window.confirm('确认原目录缺失并为该公司重新绑定已有目录？不会移动或复制文件。\n公司：' + row.name + '\n原目录：' + base + row.folder + '\n新目录：' + base + folder)) return;
+        checkContext(snapshot, cs);
+        setOwnership(null); setFolderChoices({});
+        try {
+          await post('unallocated-rebind-missing', { abs: snapshot.abs, companyId: String(row.companyId), previousFolder: row.folder, folder, confirmText: '确认原目录缺失并重新绑定' });
+        } finally {
+          if (alive.current && JSON.stringify(snapshot) === JSON.stringify(context.current)) await readOwnership(snapshot, cs);
+        }
+      });
+      const init = () => run('init', async () => {
+        const snapshot = currentContext();
+        const d = await post('unallocated-init', { abs: snapshot.abs });
+        if (!alive.current || JSON.stringify(snapshot) !== JSON.stringify(context.current)) return;
+        setInited(true);
+        toast((d.created ? '未分配资料目录已创建' : '未分配资料目录已存在') + (d.dir ? '：' + d.dir : ''), 'info');
+        await openSub('00财务资料/00未分配财务资料');
+      });
+      const scan = () => {
+        if (busyRef.current) return;
+        if (pending && !window.confirm('重新扫描将放弃未执行的选择和预演，继续吗？')) return;
+        run('scan', async () => {
+          const snapshot = currentContext(), cs = companies();
+          const d = await post('unallocated-scan', { abs: snapshot.abs, companies: cs });
+          checkContext(snapshot, cs);
+          if (!Array.isArray(d.files)) throw new Error('扫描响应缺少文件列表');
+          setData({ response: d, companies: cs, context: snapshot }); setChoices({}); setPreview(null); setResults(null); setPending(true);
+        });
+      };
+      const selected = () => {
+        if (!data) throw new Error('请先扫描');
+        const files = data.response.files.filter(f => (choices[String(f.id)] || {}).checked);
+        if (!files.length) throw new Error('请勾选要分配的文件');
+        const ids = new Set(), names = new Set();
+        return files.map(f => {
+          const c = choices[String(f.id)] || {};
+          if (!f.id || ids.has(String(f.id)) || !f.name || names.has(f.name) || !f.sourceHash || f.error || !data.companies.some(x => x.id === c.companyId) || !categories.includes(c.category)) throw new Error('文件不可用或缺少明确公司、类别，请核对选择');
+          ids.add(String(f.id)); names.add(f.name);
+          return { name: f.name, sourceHash: f.sourceHash, companyId: c.companyId, category: c.category };
+        });
+      };
+      const validatePreview = (d, items) => {
+        if (!Array.isArray(d.items) || !Array.isArray(d.errors) || d.items.length !== items.length) throw new Error('预演返回不完整，已阻止执行');
+        const expected = items.map(x => JSON.stringify(x)).sort();
+        const returned = d.items.map(x => JSON.stringify({ name: x.name, sourceHash: x.sourceHash, companyId: x.companyId, category: x.category })).sort();
+        if (JSON.stringify(expected) !== JSON.stringify(returned)) throw new Error('预演项目与所选文件不一致，已阻止执行');
+        if (!d.ok && !d.errors.length) d.errors = [d.error || '预演未通过'];
+        const destinations = d.items.filter(x => x.destination).map(x => String(x.destination).replace(/\\/g, '/').toLowerCase());
+        if (new Set(destinations).size !== destinations.length) d.errors = d.errors.concat(['预演目标重复，已阻止执行']);
+        return d;
+      };
+      const requestPreview = async (items) => {
+        checkContext(data.context, data.companies);
+        const d = await post('unallocated-preview', { abs: data.context.abs, companies: data.companies, items }, true);
+        checkContext(data.context, data.companies);
+        return validatePreview(d, items);
+      };
+      const doPreview = () => run('preview', async () => {
+        const items = selected(); const d = await requestPreview(items);
+        setPreview({ response: d, items }); setResults(null);
+      });
+      const apply = () => run('apply', async () => {
+        if (!preview) throw new Error('请先预演');
+        const items = selected();
+        if (JSON.stringify(items) !== JSON.stringify(preview.items)) throw new Error('选择已改变，请重新预演');
+        const fresh = await requestPreview(items);
+        if (JSON.stringify(fresh) !== JSON.stringify(preview.response)) { setPreview({ response: fresh, items }); throw new Error('重新预演结果已变化，请检查新清单后再次确认'); }
+        if (fresh.errors.length || fresh.items.some(x => x.error || !x.destination)) throw new Error('预演发现冲突或目标不明，禁止分配');
+        if (!window.confirm('确认按预演清单复制 ' + items.length + ' 个文件？源文件保留，不覆盖已有文件；可能部分成功。')) return;
+        checkContext(data.context, data.companies);
+        let d;
+        try { d = await post('unallocated-apply', { abs: data.context.abs, companies: data.companies, items, confirmText: '确认分配财务资料' }, true); }
+        catch (e) { if (alive.current) { setPreview(null); setResults({ results: [], error: '执行状态不明，可能部分成功；请检查目标目录，勿盲目重试：' + String(e.message || e) }); } return; }
+        if (!alive.current) return;
+        if (!Array.isArray(d.results)) throw new Error('执行结果不完整；状态不明，请先检查目标目录，不要盲目重试');
+        setResults({ ok: !!d.ok, results: d.results, error: d.error || '' }); setPreview(null); setPending(false);
+        toast('分配已返回，请逐项核对结果；可能部分成功，源文件保留。', 'info');
+      });
+      const change = (id, value) => { setChoices(prev => Object.assign({}, prev, { [id]: Object.assign({}, prev[id] || {}, value) })); setPreview(null); setPending(true); };
+      return h('div', { className: 'pf-card', style: { margin: '10px 0' } },
+        h('b', null, '未分配财务资料'),
+        h('p', { className: 'pf-hint' }, '项目级目录内文件需逐项勾选并明确选择公司和类别，识别建议仅供参考。分配只复制文件，保留源文件，不覆盖，不解析或写入天源。'),
+        h('fieldset', { disabled: !!busy, style: { border: 0, padding: 0, margin: 0, minWidth: 0 } },
+          h('div', { className: 'pf-card' },
+            h('b', null, '公司目录归属'),
+            h('p', { className: 'pf-hint' }, '旧目录不会按名称自动认领；请核对目录内容和公司身份后逐项绑定。未绑定或名称变更时请先处理归属，不会自动复制文件。'),
+            h('button', { type: 'button', className: 'pf-btn', onClick: loadOwnership }, '读取公司目录归属'),
+            ownership && JSON.stringify(ownership.context) === JSON.stringify(currentContext()) && JSON.stringify(ownership.companies) === JSON.stringify(companies())
+              ? h('div', { className: 'pf-table-wrap' }, h('table', { className: 'pf-grid pw-grid' },
+                  h('thead', null, h('tr', null, ['公司', '归属状态', '已绑定目录', '手动选择已有目录'].map(x => h('th', { key: x }, x)))),
+                  h('tbody', null, ownership.rows.map(row => h('tr', { key: String(row.companyId) },
+                    h('td', null, row.name, '（ID：', String(row.companyId), '）', row.recordedName && row.recordedName !== row.name ? '；原名称：' + row.recordedName : ''),
+                    h('td', null, ({ bound: '已绑定', unbound: '未绑定', name_changed: '名称已变更，需核实', folder_missing: '目录缺失', identity_unverified: '目录身份未验证', folder_changed: '目录身份已变化，需核实' })[row.status] || String(row.status || '未知')),
+                    h('td', null, row.folder ? ownership.context.abs.replace(/[\\/]+$/, '') + '/02现场资料/企业提供资料/00财务资料/' + row.folder : '未绑定'),
+                    h('td', null, row.status === 'name_changed'
+                      ? h('button', { type: 'button', className: 'pf-btn', onClick: () => confirmOwnershipRename(row) }, '核实并确认更名')
+                      : ['identity_unverified', 'folder_changed'].includes(row.status)
+                        ? h('button', { type: 'button', className: 'pf-btn', onClick: () => confirmFolderIdentity(row) }, '核实并确认目录身份')
+                      : row.status === 'unbound' || row.status === 'folder_missing' ? h('span', null,
+                        h('select', { className: 'pf-sel', value: folderChoices[String(row.companyId)] || '', onChange: e => { setPreview(null); setFolderChoices(prev => Object.assign({}, prev, { [String(row.companyId)]: e.target.value })); } },
+                          h('option', { value: '' }, '请明确选择已有目录'), ownership.folders.map(folder => h('option', { key: folder, value: folder }, folder))),
+                        h('button', { type: 'button', className: 'pf-btn', disabled: !folderChoices[String(row.companyId)], onClick: () => row.status === 'unbound' ? bindOwnership(row) : rebindMissingOwnership(row) }, row.status === 'unbound' ? '确认认领' : '确认缺失并重新绑定')) : '—'))))))
+              : h('p', { className: 'pf-hint' }, '尚未读取归属或项目状态已变化，请先读取。')),
+          inited
+            ? h('div', { className: 'pw-acts', style: { alignItems: 'center' } },
+              h('span', { className: 'pf-hint' }, '✅ 未分配财务资料目录已创建，可直接扫描分配。'),
+              h('button', { type: 'button', className: 'pf-btn', onClick: init }, '打开未分配资料文件夹'))
+            : h('button', { type: 'button', className: 'pf-btn', onClick: init }, '创建并打开未分配目录'),
+          h('button', { type: 'button', className: 'pf-btn', onClick: scan }, data ? '重新扫描' : '扫描未分配目录'),
+          busy ? h('span', { className: 'pf-hint' }, ' 操作进行中…') : null,
+          data ? h('div', null,
+            h('p', { className: 'pf-hint' }, '来源目录：' + (data.response.dir || '未返回') + '；勾选项将单独预演目标，已有目标文件或重复目标将拦截。'),
+            h('div', { className: 'pf-table-wrap', style: { overflow: 'auto' } }, h('table', { className: 'pf-grid pw-grid' },
+              h('thead', null, h('tr', null, ['选择', '文件 / 错误', '识别公司与证据', '识别类别与证据', '目标公司', '资料类别'].map(t => h('th', { key: t }, t)))),
+              h('tbody', null, data.response.files.map((f, i) => {
+                const id = String(f.id || ''), c = choices[id] || {}, co = f.company || {}, cl = f.classification || {};
+                const suggestion = data.companies.find(x => x.id === String(co.suggestedCompany || ''));
+                return h('tr', { key: id || i },
+                  h('td', null, h('input', { type: 'checkbox', checked: !!c.checked, disabled: !!f.error || !id || !f.sourceHash, onChange: e => change(id, { checked: e.target.checked }) })),
+                  h('td', null, f.name, f.error ? '；错误：' + f.error : ''),
+                  h('td', null, '状态：' + (co.status || '未知') + '；建议：' + (suggestion ? suggestion.name : '无') + '；候选：' + JSON.stringify(co.candidates || []) + '；证据：' + JSON.stringify(co.evidence || [])),
+                  h('td', null, '状态：' + (cl.status || '未知') + '；建议：' + (cl.suggestedFolder || '无') + '；候选：' + JSON.stringify(cl.candidates || []) + '；证据：' + JSON.stringify(cl.evidence || [])),
+                  h('td', null, h('select', { className: 'pf-sel', value: c.companyId || '', disabled: !!f.error, onChange: e => change(id, { companyId: e.target.value }) }, h('option', { value: '' }, '请明确选择'), data.companies.map(x => h('option', { key: x.id, value: x.id }, x.name)))),
+                  h('td', null, h('select', { className: 'pf-sel', value: c.category || '', disabled: !!f.error, onChange: e => change(id, { category: e.target.value }) }, h('option', { value: '' }, '请明确选择'), categories.map(x => h('option', { key: x, value: x }, x)))));
+              })))),
+            h('button', { type: 'button', className: 'pf-btn pri', onClick: doPreview }, '预演所选分配'),
+            preview ? h('div', null, h('b', null, '预演清单（请核对来源、目标及冲突）'),
+              (preview.response.errors || []).map((x, i) => h('p', { key: i, className: 'pf-hint', style: { color: '#c96a00' } }, typeof x === 'string' ? x : JSON.stringify(x))),
+              h('div', { className: 'pf-table-wrap' }, h('table', { className: 'pf-grid pw-grid' }, h('thead', null, h('tr', null, ['来源', '目标', '冲突 / 错误'].map(t => h('th', { key: t }, t)))), h('tbody', null, preview.response.items.map((x, i) => h('tr', { key: i }, h('td', null, ((data.response.files || []).find(f => f.name === x.name) || {}).path || x.name), h('td', null, x.destination || '未返回'), h('td', null, x.error || '无')))))),
+              h('button', { type: 'button', className: 'pf-btn pri', disabled: !!preview.response.errors.length || preview.response.items.some(x => x.error || !x.destination), onClick: apply }, '重新预演并确认分配')) : null) : null,
+          results ? h('div', null, h('b', null, '逐项执行结果（可能部分成功）'), results.error ? h('p', null, results.error) : null, results.results.map((x, i) => h('p', { key: i, className: 'pf-hint' }, JSON.stringify(x))), h('p', { className: 'pf-hint' }, '执行后请核对目标文件；如状态不明请先检查，不要重复执行。')) : null));
+    }
+
+    function EquityPanel({ project, s, toast, openSub, onOpenCo, goFiles }) {
+      const abs = projectAbs(project);
       const list = eqListOf(s, project.id);
       const rows = useMemo(() => eqRows(list), [list]);
       const eqIdx = useMemo(() => eqById(rows), [rows]);
@@ -3125,6 +3372,16 @@ window.__ModuleLoader__.load({
         toast('已删除：' + r.name, 'warn');
       };
       return h('div', null,
+        abs ? h('div', { className: 'pf-card', style: { margin: '0 0 10px' } },
+          h('b', null, '开始前的目录设置'),
+          h('p', { className: 'pf-hint' }, '进入项目先到「项目文件」页签完成：① 核对项目文件夹绑定；② 读取并绑定公司目录归属；③ 把未分配财务资料分配到各公司。完成后再回这里做股权信息、报表导入等作业。'),
+          h('div', { className: 'pw-acts' },
+            h('button', { type: 'button', className: 'pf-btn pri', onClick: () => goFiles && goFiles() }, '前往「项目文件」设置')))
+        : h('div', { className: 'pf-card', style: { margin: '0 0 10px', borderColor: '#f0b4b4', background: '#fff7f7' } },
+          h('b', null, '项目尚未绑定真实文件夹'),
+          h('p', { className: 'pf-hint' }, '财务资料、未分配资料等功能都依赖真实目录。请先到「项目文件」页签绑定项目文件夹，再做其他作业。'),
+          h('div', { className: 'pw-acts' },
+            h('button', { type: 'button', className: 'pf-btn pri', onClick: () => goFiles && goFiles() }, '前往「项目文件」绑定'))),
         h('div', { className: 'pw-bar' },
           h('div', { className: 'pw-filters' },
             h('label', null, '公司名称', h('input', { className: 'pf-in', value: q.name, onChange: e => setQ(Object.assign({}, q, { name: e.target.value })), placeholder: '请输入公司名称' })),
@@ -3214,7 +3471,7 @@ window.__ModuleLoader__.load({
             h('button', { type: 'button', className: 'pf-btn sm', onClick: () => setFinSub('') }, '← 返回财务资料目录'),
             h('span', { className: 'pw-co-title' }, h('b', { className: 'pf-mono' }, cur.code), h('span', { className: 'pw-co-name' }, cur.name)),
             h('span', { className: 'pf-hint' }, '报表导入（01财务报表）'),
-            h('button', { type: 'button', className: 'pf-btn', title: folder + '/01财务报表', onClick: () => openSub(folder + '/01财务报表') }, '打开文件夹')),
+            h('button', { type: 'button', className: 'pf-btn', title: folder + '/01财务报表', onClick: () => openSub(folder + '/01财务报表') }, '打开报表文件夹')),
           h(FinancePanel, { project: project, s: s, toast: toast, openSub: openSub, lockId: cur.id }));
       }
       return h('div', null,
@@ -3345,7 +3602,6 @@ window.__ModuleLoader__.load({
     const fsTypeName = k => (k === 'income_statement' ? '利润表' : '资产负债表');
     const fsModeName = m => (String(m) === '2' ? '合并' : '单体');
     // 这份数据不是从本地文件读来的，而是「查看天源已导入」时从天源模板拼出来的空白报表
-    const fsIsTyOnly = sd => !!(sd && sd.tyOnly);
     // 天源模板的科目顺序（和天源「财务报表」里的行完全一致），没导入文件时用来列空白报表
     const FS_TPL_BALANCE = ['流动资产：', '货币资金', '交易性金融资产', '衍生金融资产', '应收票据', '应收账款', '应收款项融资', '预付款项', '其他应收款', '存货', '合同资产', '持有待售资产', '一年内到期的非流动资产', '其他流动资产', '流动资产合计', '非流动资产：', '债权投资', '其他债权投资', '长期应收款', '长期股权投资', '其他权益工具投资', '其他非流动金融资产', '投资性房地产', '固定资产', '在建工程', '生产性生物资产', '油气资产', '使用权资产', '无形资产', '开发支出', '商誉', '长期待摊费用', '递延所得税资产', '其他非流动资产', '非流动资产合计', '资产总计', '流动负债：', '短期借款', '交易性金融负债', '衍生金融负债', '应付票据', '应付账款', '预收款项', '合同负债', '应付职工薪酬', '应交税费', '其他应付款', '持有待售负债', '一年内到期的非流动负债', '其他流动负债', '流动负债合计', '非流动负债：', '长期借款', '应付债券', '租赁负债', '长期应付款', '长期应付职工薪酬', '预计负债', '递延收益', '递延所得税负债', '其他非流动负债', '非流动负债合计', '负债合计', '所有者权益：', '实收资本', '其他权益工具', '资本公积', '减：库存股', '其他综合收益', '专项储备', '盈余公积', '未分配利润', '所有者权益合计', '负债和所有者权益总计', '固定资产账面原值', '无形资产账面原值', '长期待摊费用原始账面价值'];
     const FS_TPL_INCOME = ['一、营业收入', '其中：主营业务收入', '其他业务收入', '减：营业成本', '其中：主营业务成本', '其他业务成本', '税金及附加', '销售费用', '管理费用', '研发费用', '财务费用', '其中：利息费用', '利息收入', '加：其他收益', '投资收益（损失以“-”号填列）', '其中：对联营企业和合营企业的投资收益', '以摊余成本计量的金融资产终止确认收益', '净敞口套期收益（损失以“-”号填列）', '公允价值变动收益（损失以“-”号填列）', '信用减值损失（损失以“-”号填列）', '资产减值损失（损失以“-”号填列）', '资产处置收益（损失以“-”号填列）', '二、营业利润（亏损以“-”号填列）', '加：营业外收入', '减：营业外支出', '三、利润总额（亏损总额以“-”号填列）', '减：所得税费用', '四、净利润（净亏损以“-”号填列）', '五、净利润报表数（净亏损以“-”号填列）'];
@@ -3376,7 +3632,8 @@ window.__ModuleLoader__.load({
             const t = isTitle(n);
             // 天源模板里写作「减：库存股」「其中：…」，源表里常常只写「库存股」，两边都试一次
             const key = String(n).replace(/\s/g, '');
-            const hit = tyMemo ? (tyMemo.get(key) || tyMemo.get(key.replace(/^(减|加|其中)[:：]/, ''))) : null;
+            const bareKey = key.replace(/^[一二三四五六七八九十]+、/, '').replace(/^(减|加|其中)[:：]/, '').replace(/[（(].*$/, '');
+            const hit = tyMemo ? (tyMemo.get(key) || tyMemo.get(bareKey)) : null;
             return h('tr', { key: i, style: t ? { background: 'rgba(47,127,240,.04)' } : null },
               h('td', { style: t ? { fontWeight: 600 } : null }, String(n)),
               per.map((p, j) => h('td', { key: j, style: { textAlign: 'right' } }, hit ? fmtv(hit[p.year]) : '')));
@@ -3474,6 +3731,9 @@ window.__ModuleLoader__.load({
       const [ty, setTy] = useState({ status: '', error: '', projects: [], companies: [] });
       const [mode, setMode] = useState('1');
       const [tab, setTab] = useState('balance_sheet');
+      const [financeStep, setFinanceStep] = useState(0); // 仅控制界面，不改变报表或预检凭证
+      const [previewOpen, setPreviewOpen] = useState(false); // 明细按需展开，默认不占用页面
+      const previewContextRef = useRef(null);
       const [result, setResult] = useState(null);       // get_reports 拉回来的结果
       const fileBalRef = useRef(null);
       const fileIncRef = useRef(null);
@@ -3482,7 +3742,8 @@ window.__ModuleLoader__.load({
       const [scan, setScan] = useState(null);       // /project/finance/scan 的结果
       const [scanKeep, setScanKeep] = useState({}); // 每期是否参与导入（默认全选）
       const [scanForce, setScanForce] = useState({}); // 人工指定的页分类 {文件名::页名: 'balance'|'income'|'skip'}
-      const [scanOpen, setScanOpen] = useState(true);   // 扫描卡详情是否展开（扫完自动入本地时收成一行）
+      const [scanOpen, setScanOpen] = useState(true);   // 扫描卡详情是否展开
+      const [scanPending, setScanPending] = useState(false); // 新扫描或勾选变更尚未确认保存
       const [batch, setBatch] = useState(null);     // 批量预检结果（待一次确认）
       const [batchOpen, setBatchOpen] = useState(false); // 预检金额明细是否展开
       const [aiBusy, setAiBusy] = useState(false);  // AI 兜底解析进行中
@@ -3496,11 +3757,14 @@ window.__ModuleLoader__.load({
       const cid = cur ? cur.id : '';
       const box = cur ? fsOf(s, project.id, cid, mode) : { balance_sheet: fsEmptyStmt(), income_statement: fsEmptyStmt() };
       const sd = box[tab] || fsEmptyStmt();
+      previewContextRef.current = { cid: String(cid), mode: String(mode), tab };
       // 报表显示期数：金额列＝从评估基准日所在年度起，一年一列往回推（默认 6 期，和天源参数设置一致）
       const nPeriods = Math.max(1, Math.min(FS_PERIODS_MAX, Number(box.periods) || FS_PERIODS_DEFAULT));
       const baseDate = fsBaseDate(project);
       const periods = fsPeriods(sd, nPeriods, baseDate);
-      const tyMemo = fsIsTyOnly(sd) ? fsTyMemo((result && result.tyRows) || []) : null;
+      // 天源结果只在本次只读查询且页签匹配时展示；其余情况下优先显示本地拟导入数据。
+      const showTy = !!result && result.statementType === tab && result.projectId === String(box.tyProjectId || '') && result.companyId === String(box.tyCompanyId || '') && result.mode === String(mode) && result.localCompanyId === String(cid);
+      const tyMemo = showTy ? fsTyMemo(result.tyRows || []) : null;
       const setPeriods = n => fsTop(project.id, cid, () => ({ periods: Math.max(1, Math.min(FS_PERIODS_MAX, Number(n) || FS_PERIODS_DEFAULT)) }));
       const tot = fsTotals(sd);
 
@@ -3527,7 +3791,7 @@ window.__ModuleLoader__.load({
       // 切到某家天源项目 → 拉它下面的公司
       const pickTyProject = async tyProjectId => {
         setTy(x => Object.assign({}, x, { companies: [] }));
-        setBatch(null); setAiNote(null);   // 换了天源项目，之前的确认 token 一律作废
+        setBatch(null); setResult(null); setAiNote(null);   // 目标变化后确认 token 与旧预览作废
         fsTop(project.id, cid, () => ({ tyProjectId: tyProjectId, tyCompanyId: '' }));
         if (!tyProjectId) return;
         try {
@@ -3559,7 +3823,7 @@ window.__ModuleLoader__.load({
             if (got) {
               const one = Object.assign(fsEmptyStmt(), got, { fileName: f.name, importedAt: new Date().toISOString() });
               // 单文件导入也落进 byYear，跟「01财务报表」扫出来的一样，后面统一走「保存并写入天源系统」
-              const byYear = Object.assign({}, b.byYear || {});
+              const byYear = Object.assign({}, (b[only] || {}).byYear || {});
               if (got.year) byYear[String(Number(got.year))] = one;
               next[only] = Object.assign({}, one, { byYear });
             }
@@ -3603,7 +3867,7 @@ window.__ModuleLoader__.load({
       const call = async (name, args) => {
         const r = await fetch(PREFIX + '/ty/call', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name: name, arguments: args || {} }) });
         const d = await r.json().catch(() => ({}));
-        if (!r.ok) throw new Error('HTTP ' + r.status);
+        if (!r.ok) throw new Error('HTTP ' + r.status + (d && (d.error || d.message) ? '：' + String(d.error || d.message).slice(0, 500) : ''));
         if (d && d.isError) throw new Error(typeof d.data === 'string' ? d.data.slice(0, 300) : '天源返回错误');
         return d && d.data !== undefined ? d.data : d && d.structuredContent;
       };
@@ -3611,6 +3875,8 @@ window.__ModuleLoader__.load({
       // ── 从「01财务报表」文件夹批量导入 ───────────────────────────────
       // 客户把各期报表原件丢进 00财务资料/<公司>/01财务报表，这里扫一遍目录，
       // 自动认出每页是资还是利、属于哪一年；认不出的页让用户指定分类；然后一次预检、一次确认写天源。
+      const scanPackKey = p => p.statementType + '@' + p.year + (p.comparisonSource ? '@comparison@' + p.fileName + '@' + p.sheet : '');
+      const yearConflictFor = (notes, p) => (notes || []).find(n => n.requiresConfirmation && n.statementType === p.statementType && n.fileName === p.fileName);
       const scanFolder = async (force) => {
         if (!cur) return;
         setBusy('scan');
@@ -3621,7 +3887,7 @@ window.__ModuleLoader__.load({
             method: 'POST', headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
               folder: folderNameOf(project), abs: projectAbs(project),
-              company: cur.name, basedate: baseDate || '',
+              projectId: String(project.id), companyId: String(cid), basedate: baseDate || '',
               force: force || scanForce,
             }),
           });
@@ -3629,35 +3895,30 @@ window.__ModuleLoader__.load({
           const d = await r.json().catch(() => ({}));
           if (!r.ok || !d.ok) throw new Error((d && d.error) || ('HTTP ' + r.status));
           setScan(d);
+          setScanPending(true);
+          setScanOpen(true);
           // 重扫时保留用户已经取消的勾选（只给新出现的期默认打勾），免得人工分类一次就把选择清掉
           setScanKeep(prev => {
             const keep = {};
             (d.packs || []).forEach(p => {
-              const k = p.statementType + '@' + p.year;
-              keep[k] = prev[k] === undefined ? true : prev[k];
+              const k = scanPackKey(p);
+              keep[k] = yearConflictFor(d.yearNotes, p) ? false : (prev[k] === undefined ? !p.comparisonSource : prev[k]);
             });
             return keep;
           });
           const n = (d.packs || []).length;
           const nm = (d.needManual || []).length;
           if (!(d.files || []).length) {
-            toast('「01财务报表」文件夹是空的：把各期报表放进去再点一次（已帮你把目录建好）', 'warn');
+            toast('「01财务报表」文件夹是空的：把各期报表放进去再点一次。', 'warn');
           } else if (!n) {
             toast('扫到 ' + d.files.length + ' 个文件，但没有认出可导入的报表' + (nm ? '，有 ' + nm + ' 页需要你指定分类' : ''), 'warn');
           } else {
-            // 精简流程：全部认出且无需人工分类时，直接自动写入本地报表，扫描卡收成一行。
-            // 有待分类页时保持展开，让人先把分类定下来（自动写入已认出的部分）。
-            const auto = !nm;
-            if (auto) {
-              writePacksToLocal((d.packs || []), '已自动写入本地报表 ' + n + ' 张（' + (d.summary.balanceYears.join('/') || '') + ' 资 / ' + (d.summary.incomeYears.join('/') || '') + ' 利），核对无误后点右下角「预检」，预检通过在确认卡里点「保存并写入天源系统」');
-              setScanOpen(false);
-            } else {
-              setScanOpen(true);
-              toast('扫到 ' + d.files.length + ' 个文件，认出 ' + n + ' 张报表（' + (d.summary.balanceYears.join('/') || '无') + ' 资 · ' + (d.summary.incomeYears.join('/') || '无') + ' 利），' + nm + ' 页待指定分类', 'warn');
-            }
+            setScanOpen(true);
+            toast('扫到 ' + d.files.length + ' 个文件，识别 ' + n + ' 张报表' + (nm ? '，' + nm + ' 页待指定分类' : '') + '。请核对后确认保存到本地。', nm ? 'warn' : 'info');
           }
         } catch (e) {
-          toast('扫描失败：' + String((e && e.message) || e), 'warn');
+          setScan(null); setScanOpen(false); setScanPending(false);
+          toast('扫描失败：' + String((e && e.message) || e) + '。若公司目录未绑定或归属异常，请返回项目股权信息页的“公司目录归属”核实处理。', 'warn');
         } finally { setBusy(''); }
       };
       // 人工指定某页的分类 → 记下选择后重扫（force 覆盖自动判定）
@@ -3701,8 +3962,8 @@ window.__ModuleLoader__.load({
           const r = await fetch(PREFIX + '/project/finance/ai-parse', {
             method: 'POST', headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
-              folder: folderNameOf(project), abs: projectAbs(project),
-              company: cur.name, basedate: baseDate || '', targets,
+              abs: projectAbs(project), projectId: String(project.id), companyId: String(cid),
+              basedate: baseDate || '', targets,
               provider: (aiPick || '').split('::')[0] || '',
               model: (aiPick || '').split('::')[1] || '',
             }),
@@ -3714,17 +3975,9 @@ window.__ModuleLoader__.load({
           const errs = d.errors || [];
           setAiNote({ ok: got.length, errors: errs });
           if (got.length) {
-            // AI 读出来的期直接并进扫描结果；全部人工分类页都解决了就顺手自动写入本地。
-            // 自动写入放在 setScan 之外：updater 里带副作用会在 StrictMode 下被调两次。
-            const doneSet = {};
-            got.forEach(p => { doneSet[p.fileName + '::' + p.sheet] = true; });
-            const remaining = (scan.needManual || []).filter(m => !doneSet[m.fileName + '::' + m.sheet]);
-            if (!remaining.length) {
-              const merged = ((scan.packs || []).filter(x => scanKeep[x.statementType + '@' + x.year]))
-                .concat(got.filter(p => p.statementType && p.year));
-              writePacksToLocal(merged, 'AI 读出 ' + got.length + ' 张，已自动写入本地报表，核对无误后点右下角「预检」，预检通过在确认卡里点「保存并写入天源系统」');
-              setScanOpen(false);
-            }
+            // AI 结果仅加入待核对清单，须由用户确认后才写入本地。
+            setScanPending(true);
+            setScanOpen(true);
             setScan(prev => {
               if (!prev) return prev;
               const done = {};
@@ -3742,7 +3995,7 @@ window.__ModuleLoader__.load({
             });
             setScanKeep(prev => {
               const keep = Object.assign({}, prev);
-              got.forEach(p => { const k = p.statementType + '@' + p.year; if (keep[k] === undefined) keep[k] = true; });
+              got.forEach(p => { const k = scanPackKey(p); if (yearConflictFor((scan && scan.yearNotes), p)) keep[k] = false; else if (keep[k] === undefined) keep[k] = !p.comparisonSource; });
               return keep;
             });
           }
@@ -3806,17 +4059,40 @@ window.__ModuleLoader__.load({
             return Object.assign({}, w, { finance: all });
           });
         }
-        const ys = packs.map(x => x.statementType === 'income_statement' ? '利' : '资').join('');
-        toast(note || ('已写入本地报表 ' + packs.length + ' 张表（' + packs.map(x => x.year).join('/') + '），先在下面逐期核对，没问题再点「预检」，预检通过在确认卡里点「保存并写入天源系统」'), 'info');
+        const savedBox = fsOf(store.get(), project.id, cid, mode);
+        const missing = packs.filter(x => {
+          const saved = (((savedBox[x.statementType] || {}).byYear || {})[String(Number(x.year))]);
+          return !saved || saved.fileName !== x.fileName || JSON.stringify(saved.sheetData) !== JSON.stringify(x.sheetData || null);
+        });
+        if (missing.length) {
+          toast('本地保存后回读缺少：' + missing.map(x => fsTypeName(x.statementType) + ' ' + x.year).join('、') + '。请勿预检写入天源。', 'warn');
+          return false;
+        }
+        toast(note || ('已保存至本地：' + packs.map(x => fsTypeName(x.statementType) + ' ' + x.year).join('、') + '。请逐期核对；此时尚未写入天源。'), 'info');
+        return true;
       };
       // 手动按钮：按当前勾选写入本地
       const applyScanToLocal = () => {
-        writePacksToLocal(((scan && scan.packs) || []).filter(x => scanKeep[x.statementType + '@' + x.year]));
+        const selected = ((scan && scan.packs) || []).filter(x => scanKeep[scanPackKey(x)]);
+        if (!selected.length) { toast('没有勾选任何要导入的报表', 'warn'); return; }
+        const keys = selected.map(x => x.statementType + '@' + Number(x.year));
+        if (new Set(keys).size !== keys.length) { toast('同一报表类型和年度只能选择一张，请取消重复项后再保存。', 'warn'); return; }
+        const overlaps = selected.filter(x => (((box[x.statementType] || {}).byYear || {})[String(Number(x.year))]));
+        if (overlaps.length && !window.confirm('以下本地报表已有数据，将被替换：\n' + overlaps.map(x => fsTypeName(x.statementType) + ' ' + x.year + '（' + x.fileName + '）').join('\n') + '\n\n确认保存到本地？天源数据不会改变。')) return;
+        setBatch(null);
+        if (!writePacksToLocal(selected)) return;
+        setScanPending(false);
+        setScanOpen(false);
+        setResult(null);
+        setFinanceStep(1);
       };
 
       // 把「本地已存的各期报表」推到天源：每种报表类型一次 prepare（sheetList 装该类型所有年度），
       // 预检通过后再一次确认全部写入。数据来源是本地 byYear，也就是上面预览表给人核对的那份。
       const prepareBatch = async () => {
+        if (scan && scanPending) { toast('请先确认保存或放弃扫描结果，再预检。', 'warn'); return; }
+        // 预检展示本地拟导入数据；不改变 byYear、目标或现有天源数据。
+        setResult(null);
         // 写天源前先过一遍校验：不一致就让人明确确认，避免把明显有问题的数写进去
         // 两种报表类型分别校验（同一年两者都有，合并到一张 Map 会互相覆盖），结果合并
         const vBad = [];
@@ -3874,14 +4150,19 @@ window.__ModuleLoader__.load({
             errs.push({ statementType: st, error: String((e && e.message) || e), details: [] });
           }
         }
-        setBatch({ runs: runs, errors: errs });
+        setBatch({ runs: runs, errors: errs, projectId: String(p), companyId: String(c), mode: String(mode), dataSnapshot: JSON.stringify(['balance_sheet', 'income_statement'].map(st => ((box[st] || {}).byYear || {}))) });
         if (!runs.length) toast('预检没通过，看下面的原因', 'warn');
         else toast('预检通过 ' + runs.length + ' 张表' + (errs.length ? '，' + errs.length + ' 张没过' : '') + '，核对后点确认', 'info');
         setBusy('');
       };
       // 一次确认：把预检通过的表逐张写进天源
       const executeBatch = async () => {
+        if (scan && scanPending) { toast('请先确认保存或放弃扫描结果，并重新预检。', 'warn'); return; }
         if (!batch || !batch.runs.length) return;
+        if (!batch.projectId || !batch.companyId || batch.projectId !== String(box.tyProjectId || '') || batch.companyId !== String(box.tyCompanyId || '') || batch.mode !== String(mode) || batch.dataSnapshot !== JSON.stringify(['balance_sheet', 'income_statement'].map(st => ((box[st] || {}).byYear || {})))) {
+          toast('预检目标或本地报表已变更，请取消后重新预检。', 'warn');
+          return;
+        }
         setBusy('batchExec');
         const done = []; const failed = [];
         for (const run of batch.runs) {
@@ -3910,8 +4191,7 @@ window.__ModuleLoader__.load({
         if (done.length) toast('已写入天源 ' + done.length + ' 张表：' + done.map(r => (r.statementType === 'income_statement' ? '利润表' : '资产负债表') + r.years.join('/')).join('、'), 'info');
         if (failed.length) toast(failed.length + ' 张表写入失败，看下面的原因', 'warn');
         setBusy('');
-        // 写成功后把天源现有年度拉回来，页签上的「（年度）」跟着更新
-        if (done.length) { try { await refreshReports(); } catch (e) {} }
+        // 不自动切换到天源视图；用户可用只读按钮主动核实写入结果。
       };
 
       // 「查看天源已导入XX表」：只拉当前页签这一种报表、当前口径，命中的已有年度用天源数据填进表里；
@@ -3934,47 +4214,23 @@ window.__ModuleLoader__.load({
           const years = ((rep && rep.existingYears) || []).map(String).sort((a, b) => Number(a) - Number(b)).slice(-5);
           const rows = (rep && rep.worksheetRows) || [];
           const anyVal = rows.some(w => { const vs = w.values || {}; return years.some(y => vs[y] != null); });
+          // 只读结果仅保存在临时视图中，不覆盖本地单文件或逐年报表。
           if (!years.length || !anyVal) {
-            fsUpdate(project.id, cid, mode, b => {
-              const next = Object.assign({}, b);
-              next[st] = Object.assign(fsEmptyStmt(), {
-                statementType: st, tyOnly: true, year: years[0] || '', period: '', fileName: '',
-                columns: years.map(y => ({ label: y, kind: 'ty' })), rows: [],
-              }, { byYear: (b[st] || {}).byYear || {} });   // 本地扫的那几期留着，别一刷新就丢
-              return next;
-            });
             toast('天源「' + fsModeName(mode) + fsTypeName(st) + '」还没有数据，已按模板列出空白报表', 'info');
           } else {
-            fsUpdate(project.id, cid, mode, b => {
-              const next = Object.assign({}, b);
-              next[st] = Object.assign(fsEmptyStmt(), {
-                statementType: st, tyOnly: true, tyMode: String(mode), year: years[0],
-                period: '天源 ' + fsModeName(mode) + ' 已导入年度 ' + years.join('/'),
-                fileName: '', columns: years.map(y => ({ label: y, kind: 'ty' })), rows: [],
-              }, { byYear: (b[st] || {}).byYear || {} });
-              return next;
-            });
             toast('已取天源『' + fsModeName(mode) + fsTypeName(st) + '』：已有年度 ' + years.join('/'), 'info');
           }
-          setResult({ statementType: st, tyYears: years, tyRows: rows, report: rep });
+          const currentTarget = fsOf(store.get(), project.id, cid, mode);
+          const context = previewContextRef.current || {};
+          if (String(currentTarget.tyProjectId || '') !== String(p) || String(currentTarget.tyCompanyId || '') !== String(c) || context.cid !== String(cid) || context.mode !== String(mode) || context.tab !== st) {
+            toast('查询期间天源目标已改变，已忽略旧结果，请重新查询。', 'warn');
+            return;
+          }
+          setResult({ statementType: st, tyYears: years, tyRows: rows, report: rep, projectId: String(p), companyId: String(c), mode: String(mode), localCompanyId: String(cid) });
+          setPreviewOpen(true);
         } catch (err) {
           toast('读取天源已导入数据失败：' + String((err && err.message) || err), 'warn');
         } finally { setBusy(''); }
-      };
-      // 清空当前公司当前口径的两张报表（读入的文件数据 + 天源预览），不动科目表和已建目录。
-      // 「清空」只清报表数据（本地多期 + 单文件 + 天源对接状态）；科目余额表等底稿类
-      // 数据不属于报表导入页，不在这里清。科目同步（syncTy）/查证资料（pullFiles）也
-      // 已从本页移除——它们是资产基础法底稿的工作流，入口在资产基础法科目页。
-      const clearAll = () => {
-        if (!cur) return;
-        fsUpdate(project.id, cid, mode, b => ({
-          tyProjectId: b.tyProjectId || '', tyCompanyId: b.tyCompanyId || '',
-          periods: b.periods || '',
-          balance_sheet: fsEmptyStmt(),
-          income_statement: fsEmptyStmt(),
-        }));
-        setResult(null);
-        toast('已清空「' + cur.name + '」' + fsModeName(mode) + '口径的资产负债表与利润表', 'info');
       };
       // 从天源同步当前公司的资产基础法科目金额（对接第 1 步）：
       // /ty/report-companies 拿天源公司清单 → 名字归一化匹配 → /ty/ab-subjects 拉 level=2 非零科目
@@ -4099,15 +4355,15 @@ window.__ModuleLoader__.load({
       // 认出来的报表：勾选要导入的期
       // 精简流程：扫描卡默认收成一行摘要（文件数/报表数/已自动写入），点「详情」才展开勾选表与人工分类区
       const packRow = (p, i) => {
-        const k = p.statementType + '@' + p.year;
+        const k = scanPackKey(p);
         return h('tr', { key: i },
           h('td', null, h('input', {
             type: 'checkbox', checked: !!scanKeep[k],
-            onChange: e => setScanKeep(Object.assign({}, scanKeep, { [k]: e.target.checked })),
+            onChange: e => { setScanPending(true); setScanKeep(Object.assign({}, scanKeep, { [k]: e.target.checked })); },
           })),
           h('td', null, p.statementType === 'income_statement' ? '利润表' : '资产负债表'),
           h('td', null, String(p.year)),
-          h('td', null, p.period || ''),
+          h('td', null, p.period || '', p.comparisonSource ? (p.statementType === 'income_statement' ? '（上年同期数候选，需勾选核对；不会自动导入）' : '（期初数候选，需勾选核对；不会自动导入）') : '', yearConflictFor(scan.yearNotes, p) ? h('strong', { style: { color: '#c96a00' } }, '；年度冲突，原始期间：' + (p.originalPeriod || yearConflictFor(scan.yearNotes, p).originalPeriod || '未提供') + '；请核实后主动勾选') : null),
           h('td', null, p.fileName),
           h('td', null, p.sheet),
           h('td', { style: { textAlign: 'right' } }, String(((p.sheetData || {}).detail || []).length)));
@@ -4127,8 +4383,8 @@ window.__ModuleLoader__.load({
       // 这里把纠正过的逐条列出来，免得用户以为年度认错了。
       const yearNoticeBox = (scan && (scan.yearNotes || []).length)
         ? h('p', { className: 'pf-hint', style: { marginTop: 6, color: '#c96a00' } }, '年度按文件名纠正：'
-          + scan.yearNotes.map(n => (n.statementType === 'income_statement' ? '利润表' : '资产负债表') + ' ' + n.fileName + ' 表头写 ' + n.from + '，按文件名取 ' + n.to).join('；')
-          + '。表头不一定可信，请在上面核对年度对不对，不对就改文件名里的年份再重新扫描。')
+          + scan.yearNotes.map(n => (n.statementType === 'income_statement' ? '利润表' : '资产负债表') + ' ' + n.fileName + ' 表头写 ' + n.from + '，按文件名取 ' + n.to + (n.requiresConfirmation ? '；原始期间：' + (n.originalPeriod || '未提供') + '，默认不勾选，请核实后主动勾选' : '')).join('；')
+          + '。请核对原始期间、年度和金额。')
         : null;
       const scanSummary = scan
         ? '「01财务报表」' + (scan.files || []).length + ' 个文件，'
@@ -4146,9 +4402,10 @@ window.__ModuleLoader__.load({
               type: 'button', className: 'pf-btn', style: { marginLeft: 'auto' },
               onClick: () => setScanOpen(!scanOpen),
             }, scanOpen ? '收起详情 ▲' : '详情 ▼'),
-            h('button', { type: 'button', className: 'pf-btn', onClick: () => { setScan(null); setBatch(null); } }, '✕')),
+            h('button', { type: 'button', className: 'pf-btn', title: '放弃本次扫描结果，不影响已保存的本地报表', disabled: busy === 'scan' || aiBusy, onClick: () => { if (scanPending && !window.confirm('放弃本次尚未保存的扫描结果？已保存的本地报表不受影响。')) return; setScan(null); setScanPending(false); setBatch(null); } }, '✕')),
           scanOpen ? h('div', null,
-            h('p', { className: 'pf-hint' }, '目录：' + (scan.rel || '') + '（把各期报表放进去后点「重新扫描」；全部认出的期已自动写入本地报表）'),
+            h('p', { className: 'pf-hint' }, '目录：' + (scan.rel || '') + '（请核对报表类型、年度及金额后确认保存到本地，不会直接写入天源）'),
+            h('p', { className: 'pf-hint' }, '上一年候选：可从年报资产负债表期初数或利润表上年同期数生成；已有独立上一年报表时不生成。候选默认不勾选，请核对来源、期间与金额后自行勾选。'),
             needManualBox,
             aiBox,
             yearNoticeBox,
@@ -4156,12 +4413,11 @@ window.__ModuleLoader__.load({
             conflictBox,
             h('div', { className: 'pw-acts', style: { marginTop: 6 } },
               h('button', { type: 'button', className: 'pf-btn', disabled: busy === 'scan', onClick: () => scanFolder() }, busy === 'scan' ? '扫描中…' : '重新扫描'),
-              h('button', { type: 'button', className: 'pf-btn', onClick: () => openSub(financeStatementsFolderOf(cur.name)) }, '打开报表文件夹'),
               h('button', {
                 type: 'button', className: 'pf-btn pri',
-                disabled: !(scan.packs || []).some(p => scanKeep[p.statementType + '@' + p.year]),
+                disabled: busy === 'scan' || aiBusy || !(scan.packs || []).some(p => scanKeep[scanPackKey(p)]),
                 onClick: applyScanToLocal,
-              }, '重新写入本地（' + ((scan.packs || []).filter(p => scanKeep[p.statementType + '@' + p.year]).length) + ' 张）')),
+              }, '确认并保存到本地（' + ((scan.packs || []).filter(p => scanKeep[scanPackKey(p)]).length) + ' 张）')),
             h('p', { className: 'pf-hint', style: { marginTop: 4 } }, '「写入本地」只存到这台机器的工作台里，不碰天源；核对无误后点右下角「预检」，预检通过在确认卡里点「保存并写入天源系统」。')
           ) : null)
         : null;
@@ -4202,6 +4458,7 @@ window.__ModuleLoader__.load({
           h('p', null, h('b', null, (batch.errors || []).length
             ? '预检结果（有未通过的）'
             : '天源预检通过：' + (batch.runs || []).map(r => (r.statementType === 'income_statement' ? '利润表' : '资产负债表') + ' ' + (r.years || []).join('/')).join('、') + '，共 ' + (batch.runs || []).reduce((s, r) => s + (((r.preview || {}).sheets) || []).length, 0) + ' 期')),
+          (batch.runs || []).length ? h('p', { className: 'pf-hint' }, '将写入：' + batch.runs.map(r => fsTypeName(r.statementType) + ' ' + (r.years || []).join('/')).join('、') + '；未通过的报表不会写入。按报表分别提交，可能部分成功，请核对结果。') : null,
           (batch.runs || []).length
             ? h('button', {
               type: 'button', className: 'pf-btn', style: { marginLeft: 8 },
@@ -4214,12 +4471,12 @@ window.__ModuleLoader__.load({
           // 这张卡对应的可能不是现在想写的公司，提示用户取消重预检最稳妥。
           !box.tyCompanyId
             ? h('p', { className: 'pf-hint', style: { margin: '6px 0 0', color: '#c96a00' } },
-              '注意：「公司」下拉现在是空的。这张预检卡是之前选的公司生成的——如果就是那家公司，直接点确认即可；不是的话先点「取消」，选好公司再重新预检。')
+              '天源公司未选择，无法确认写入目标。请取消预检，选择项目和公司后重新预检。')
             : null,
           h('div', { className: 'pw-acts', style: { marginTop: 6 } },
             h('button', {              type: 'button', className: 'pf-btn pri',
-              title: '第 2 步（真正写入）：把这张确认卡里的全部期次一次性写进天源；写完右上表格会自动拉回天源最新数',
-              disabled: busy === 'batchExec' || !(batch.runs || []).length, onClick: executeBatch,
+              title: '确认后按报表类型写入天源，可能部分成功；需要时可通过只读查询核对结果',
+              disabled: busy === 'batchExec' || !(batch.runs || []).length || !batch.projectId || !batch.companyId || batch.projectId !== String(box.tyProjectId || '') || batch.companyId !== String(box.tyCompanyId || '') || batch.mode !== String(mode) || batch.dataSnapshot !== JSON.stringify(['balance_sheet', 'income_statement'].map(st => ((box[st] || {}).byYear || {}))), onClick: executeBatch,
             }, busy === 'batchExec' ? '正在写入…' : '保存并写入天源系统'),
             h('button', {
               type: 'button', className: 'pf-btn',
@@ -4228,92 +4485,61 @@ window.__ModuleLoader__.load({
             }, '取消（不写入）')))
         : null;
 
-      return h('div', null,
+      const goFinanceStep = i => {
+        if (busy === 'scan' || aiBusy) { toast('请等待扫描或解析完成。', 'warn'); return; }
+        if (i > 0 && scan && scanPending) {
+          setScanOpen(true);
+          toast('扫描结果尚未保存：请点击「确认并保存到本地」，或关闭扫描结果后再继续。', 'warn');
+          return;
+        }
+        setFinanceStep(i);
+      };
+      return h('fieldset', { disabled: busy === 'batchExec', style: { border: 0, margin: 0, padding: 0, minWidth: 0 } },
+        h('nav', { className: 'fs-steps', 'aria-label': '报表导入步骤' },
+          ['扫描与分类', '核对本地报表', '预检与写入'].map((label, i) => h('button', {
+            key: label, type: 'button', className: 'fs-step' + (financeStep === i ? ' active' : ''),
+            'aria-current': financeStep === i ? 'step' : undefined, onClick: () => goFinanceStep(i),
+          }, h('span', { className: 'fs-step-num' }, String(i + 1)), label))),
+        financeStep !== 0 && scan && scanPending ? h('p', { className: 'pf-hint', role: 'status' }, '扫描结果尚待确认保存；下方仅展示或预检已保存到本地的报表。可返回第一步处理。') : null,
         // ── 第一行：公司 + 天源对接 + 导入按钮
         h('div', { className: 'pw-bar' },
           h('div', { className: 'pw-filters' },
-            lockId
-              ? h('label', null, '公司', h('span', { className: 'pf-hint' }, cid ? (cur.code + ' ' + cur.name) : '—'))
-              : h('label', null, '公司', h('select', { className: 'pf-sel', value: cid, onChange: e => { setWho(e.target.value); setScan(null); setBatch(null); setAiNote(null); } }, rows.map(r => h('option', { key: r.id, value: r.id }, r.code + ' ' + r.name)))),
-            // 报表导入页只留报表相关动作：科目余额表入口在目录树「02科目余额表」，
-            // 同步科目/拉查证资料属于资产基础法底稿工作流，不在这页（原「更多」收纳已撤销）。
-            h('button', { type: 'button', className: 'pf-btn', onClick: clearAll }, '清空')),
-            h('label', null, '报表口径', h('select', { className: 'pf-sel', value: mode, onChange: e => { setMode(e.target.value); setResult(null); setBatch(null); setAiNote(null); } },
-              h('option', { value: '1' }, '单体'), h('option', { value: '2' }, '合并')),
-            h('label', { title: baseDate ? ('从评估基准日 ' + baseDate + ' 所在年度往前推') : '项目里还没填评估基准日' }, '报表显示期数',
+            !lockId && financeStep === 0
+              ? h('label', null, '公司', h('select', { className: 'pf-sel', value: cid, disabled: busy === 'scan' || aiBusy, onChange: e => { if (scanPending && !window.confirm('切换公司会放弃尚未保存的扫描结果，是否继续？')) return; setWho(e.target.value); setPreviewOpen(false); setScan(null); setScanKeep({}); setScanForce({}); setScanPending(false); setBatch(null); setResult(null); setAiNote(null); } }, rows.map(r => h('option', { key: r.id, value: r.id }, r.code + ' ' + r.name)))) : null,
+            financeStep === 0 ? h('label', null, '报表口径', h('select', { className: 'pf-sel', value: mode, disabled: busy === 'scan' || aiBusy, onChange: e => { if (scanPending && !window.confirm('切换口径会放弃尚未保存的扫描结果，是否继续？')) return; setMode(e.target.value); setPreviewOpen(false); setScan(null); setScanKeep({}); setScanForce({}); setScanPending(false); setResult(null); setBatch(null); setAiNote(null); } },
+              h('option', { value: '1' }, '单体'), h('option', { value: '2' }, '合并'))) : null,
+            financeStep === 1 ? h('label', { title: baseDate ? ('从评估基准日 ' + baseDate + ' 所在年度往前推') : '项目里还没填评估基准日' }, '本地空表显示期数',
               h('select', { className: 'pf-sel', value: String(nPeriods), onChange: e => setPeriods(e.target.value) },
                 Array.from({ length: FS_PERIODS_MAX }, (x, i) => h('option', { key: i, value: String(i + 1) }, String(i + 1) + ' 期'))),
-              h('span', { className: 'pf-hint', style: { marginLeft: 4 } }, baseDate ? periods.map(p => p.year).join('/') : '先填评估基准日')),
+              h('span', { className: 'pf-hint', style: { marginLeft: 4 } }, baseDate ? periods.map(p => p.year).join('/') : '先填评估基准日')) : null,
             h('button', {
-              type: 'button', className: 'pf-btn' + (tab === 'balance_sheet' ? ' pri' : ''), disabled: busy === 'read',
+              type: 'button', className: 'pf-btn' + (tab === 'balance_sheet' ? ' pri' : ''), style: { display: financeStep === 0 ? '' : 'none' }, disabled: busy === 'read',
               onClick: () => { setImportKind('balance_sheet'); if (fileBalRef.current) fileBalRef.current.click(); },
             }, busy === 'read' && importKind === 'balance_sheet' ? '读取中…' : '导入资产负债表文件'),
             h('button', {
-              type: 'button', className: 'pf-btn' + (tab === 'income_statement' ? ' pri' : ''), disabled: busy === 'read',
+              type: 'button', className: 'pf-btn' + (tab === 'income_statement' ? ' pri' : ''), style: { display: financeStep === 0 ? '' : 'none' }, disabled: busy === 'read',
               onClick: () => { setImportKind('income_statement'); if (fileIncRef.current) fileIncRef.current.click(); },
             }, busy === 'read' && importKind === 'income_statement' ? '读取中…' : '导入利润表文件'),
-            h('button', {
-              type: 'button', className: 'pf-btn' + (scan && (scan.packs || []).length ? ' pri' : ''),
-              title: '扫 00财务资料/<公司>/01财务报表 里客户给的各期报表，自动认出资产/负债/利润各页，一次导入所有期',
-              disabled: busy === 'scan',
-              onClick: () => scanFolder(),
-            }, busy === 'scan' ? '扫描中…' : '扫描「01财务报表」导入')),
+          ),
           h('input', { type: 'file', accept: '.xlsx,.xlsm,.xls', ref: fileBalRef, style: { display: 'none' }, onChange: e => onFile(e, 'balance_sheet') }),
           h('input', { type: 'file', accept: '.xlsx,.xlsm,.xls', ref: fileIncRef, style: { display: 'none' }, onChange: e => onFile(e, 'income_statement') }),
-          h('div', { className: 'pw-acts' },
+          h('div', { className: 'pw-acts', style: { display: financeStep === 2 ? 'flex' : 'none' } },
+            h('span', { className: 'pf-hint' }, '报表口径：' + fsModeName(mode)),
             h('span', { className: 'pf-hint' }, '天源项目 '),
             h('select', { className: 'pf-sel', style: { maxWidth: 320 }, value: String(box.tyProjectId || ''), onChange: e => pickTyProject(e.target.value) },
               h('option', { value: '' }, ty.status === 'on' ? '选择天源项目' : (ty.status === 'loading' ? '连接中…' : '天源未连接')),
               tyOpts),
             h('span', { className: 'pf-hint' }, '公司 '),
-            h('select', { className: 'pf-sel', style: { maxWidth: 260 }, value: String(box.tyCompanyId || ''), onChange: e => { fsTop(project.id, cur.id, () => ({ tyCompanyId: e.target.value })); setBatch(null); setAiNote(null); } },
+            h('select', { className: 'pf-sel', style: { maxWidth: 260 }, value: String(box.tyCompanyId || ''), onChange: e => { fsTop(project.id, cur.id, () => ({ tyCompanyId: e.target.value })); setBatch(null); setResult(null); setAiNote(null); } },
               h('option', { value: '' }, '选择天源公司'), tyCOpts))),
-        // ── 页签：资产负债表 / 利润表
-        h('div', { className: 'pw-tabs' },
-          FS_TYPES.map(t => {
-            const st = box[t.key] || fsEmptyStmt();
-            // 页签上把本地存到的所有年度都列出来（一次扫了 2024/2025 两期时，一眼能看到两期都在）
-            const lys = Object.keys((st.byYear || {})).map(Number).filter(y => y > 0).sort((a, b) => a - b);
-            const tag = lys.length ? '（' + lys.join('/') + '）' : (st.sheetData ? '（' + (st.year || '') + '）' : '');
-            return h('button', { key: t.key, type: 'button', className: 'pf-btn sm' + (tab === t.key ? ' pri' : ''), onClick: () => { setTab(t.key); setResult(null); } },
-              t.name + tag);
-          }),
-          h('span', { className: 'pf-hint' }, fsIsTyOnly(sd)
-            ? ('天源「' + fsTypeName(tab) + '」（' + fsModeName(box.tyMode || mode) + '）的现有数' + (result && result.report ? '，天源已有年度 ' + ((result.report.existingYears || []).join('/') || '无') : ''))
-            : (sd.sheetData
-              ? ((localYears.length > 1 ? '本地 ' + localYears.length + ' 期：' : '本地文件：') + (localYears.length > 1 ? localYears.join('/') : ((sd.fileName || '') + (sd.sheet ? ' · 「' + sd.sheet + '」' : '') + (sd.period ? ' · ' + sd.period : ''))))
-              : '这个页签还没有导入，下面是天源' + fsTypeName(tab) + '的空白报表（可照着填、核对）'))),
-        // ── 预览表：源表科目 → 天源科目 → 金额；没导入过就按天源模板列一份空白报表
-        h('div', null,
-          h('p', { className: 'pf-hint' }, (localYears.length && !fsIsTyOnly(sd))
-            ? ('本地已存 ' + localYears.length + ' 期（' + localYears.join('/') + '），下面是逐期明细，核对无误再点「预检」；要改哪一期就回上面重新扫描。')
-            : (fsIsTyOnly(sd)
-              ? ('天源现有 ' + (((result && result.tyRows) || []).length) + ' 个科目' + (result && result.report ? ('，已有年度 ' + ((result.report.existingYears || []).join('/') || '无') + '，可导入年度 ' + ((result.report.missingYears || []).join('/') || '无')) : '') + '。')
-              : (sd.sheetData
-              ? ('本地文件可写入天源 ' + ((sd.sheetData.detail || []).length) + ' 个科目' + (((sd.sheetData.skipped || []).length) ? ('，跳过 ' + sd.sheetData.skipped.length + ' 行（' + ((sd.sheetData.skipSummary || ['天源模板里没有对应科目']).join('；')) + '）') : '')
-                + (tot['资产总计'] != null ? '；资产总计 ' + fmt(tot['资产总计']) + '，负债+权益 ' + fmt((tot['负债合计'] || 0) + (tot['所有者权益合计'] || 0)) : '')
-                + (((sd.sheetData.duplicates || []).length) ? '；重复挂同一科目 ' + sd.sheetData.duplicates.length + ' 处（保留第一处）' : ''))
-                : '下面按天源模板列出' + fsTypeName(tab) + '的全部科目，金额列按「报表显示期数」排出 ' + periods.map(p => p.year + '-12-31').join('、') + '；点上面「导入' + fsTypeName(tab) + '」读入本地文件后按所属年度填上，没有数据的年度显示「—」。'))),
-          // 本地已存了多期（从「01财务报表」一次导入各期）就按年度列出来逐期核对，这是写天源前的唯一凭据
-          (localYears.length && !fsIsTyOnly(sd))
-            ? fsBlankTable(tab, null, localPeriods, localMemo)
-            : (sd.sheetData && !fsIsTyOnly(sd)
-              ? h('div', { className: 'pf-table-wrap', style: { maxHeight: 360, overflow: 'auto' } },
-                h('table', { className: 'pf-grid pw-grid' },
-                  h('thead', null, h('tr', null, ['源表科目', '天源科目'].concat(periods.map(p => p.label)).map((t, i) => h('th', { key: i }, t)))),
-                  h('tbody', null, (sd.sheetData.detail || []).map((r, i) => {
-                    const src = (sd.rows || []).filter(x => String(x.name).replace(/\s/g, '') === String(r.originName).replace(/\s/g, ''))[0] || null;
-                    const vals = src
-                      ? periods.map(p => (p.kind === 'now' ? (src.values || [])[0] : (p.kind === 'prev' ? (src.values || [])[1] : undefined)))
-                      : periods.map(p => (p.kind === 'now' ? r.amount : undefined));
-                    return h('tr', { key: i },
-                      h('td', null, r.originName),
-                      h('td', null, r.subjectName),
-                      vals.map((v, j) => h('td', { key: j, style: { textAlign: 'right' } }, fmt(v))));
-                  }))))
-              : fsBlankTable(tab, fsIsTyOnly(sd) ? (((result && result.tyRows) || []).map(w => w.subjectName)) : null, periods, tyMemo))),
+        // 文件夹扫描是独立步骤，扫描不自动写入本地或天源。
+        financeStep === 0 ? h('div', { className: 'pf-card', style: { marginTop: 10 } },
+          h('b', null, '从文件夹扫描报表'),
+          h('p', { className: 'pf-hint' }, '把各期报表放入本公司「01财务报表」文件夹，再点击扫描。识别后核对分类和年度，勾选需要的报表并确认保存到本地。'),
+          h('button', { type: 'button', className: 'pf-btn pri', disabled: busy === 'scan', onClick: () => scanFolder() }, busy === 'scan' ? '扫描解析中…' : '扫描并解析文件夹报表')) : null,
+        financeStep === 0 ? scanBox : null,
         // ── 跨期数据校验卡：写天源前的最后一道关
-        localYears.length ? h('div', { className: 'pf-card', style: { marginTop: 10, borderLeft: '4px solid ' + (valAllOk ? '#2e9e5b' : '#e07b39') } },
+        financeStep === 1 && localYears.length ? h('div', { className: 'pf-card', style: { marginTop: 10, borderLeft: '4px solid ' + (valAllOk ? '#2e9e5b' : '#e07b39') } },
           h('div', { style: { display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8 } },
             h('p', { style: { margin: 0 } }, h('b', null, '数据校验'),
               '　' + (valChecks.length ? (valAllOk ? '✓ ' + valChecks.length + ' 项全部一致' : '⚠ ' + valBad.length + ' / ' + valChecks.length + ' 项不一致') : '暂无可校验的多期数据')),
@@ -4330,42 +4556,83 @@ window.__ModuleLoader__.load({
                 d.name + '：上年 ' + fmt(d.prev) + ' ≠ 本年 ' + fmt(d.cur) + '（差 ' + fmt(d.diff) + '）'))
             ) : null
           )) : h('p', { className: 'pf-hint' }, '只有一期本地数据时没有跨期校验项；可先导入多期再核对。'))) : null,
-        // ── 从「01财务报表」文件夹批量导入：扫描结果 / 人工分类 / 一次确认
-        scanBox,
-        // ── 批量预检结果：一次确认写全部
-        batchBox,
         // ── 写天源 / 查看天源：三个高频动作 + 一行流程说明（按钮名字短，作用靠说明讲清）
-        h('div', { className: 'pw-acts', style: { marginTop: 10 } },
-          localYears.length || (sd.sheetData && !fsIsTyOnly(sd))
-            ? h('p', { className: 'pf-hint', style: { margin: '0 0 4px' } },
-              '写天源分两步：① 点「预检（只核对不写入）」——天源会核对科目和金额，不写入任何数据；② 预检通过后弹出确认卡，在卡里点「保存并写入天源系统」才真正写入。'
-              + '「查看天源已导入」＝只读拉回天源现有数核对；「清空本地报表」＝只清这台机器上的报表，天源不动。')
-            : null,
+        h('div', { className: 'pw-acts', style: { display: financeStep === 0 ? 'none' : 'flex', marginTop: 16, alignItems: 'center', rowGap: 10 } },
           h('button', {
-            type: 'button', className: 'pf-btn pri',
+            type: 'button', className: 'pf-btn pri', style: { display: financeStep === 2 ? '' : 'none' },
             title: '第 1 步：把本地各期报表送天源预检，只核对科目和金额能不能填，不写入任何数据；通过后弹出确认卡',
-            disabled: busy === 'batch' || (!localYears.length && (!sd.sheetData || fsIsTyOnly(sd))),
+            disabled: busy === 'batch' || busy === 'refresh' || (!localYears.length && (!sd.sheetData || showTy)),
             onClick: prepareBatch,
-          }, busy === 'batch' ? '预检中…' : ('预检（只核对不写入）· ' + (mode === '2' ? '合并' : '单体') + (localYears.length ? ' · ' + localYears.join('/') : '') + '）')),
+          }, busy === 'batch' ? '预检中…' : '预检（只核对不写入）'),
           h('button', {
             type: 'button', className: 'pf-btn',
             title: '只读操作：从天源拉回当前页签这种报表的现有数填进上方表格核对，不做任何写入',
-            disabled: busy === 'refresh', onClick: refreshReports,
+            disabled: busy === 'refresh' || busy === 'batch' || busy === 'batchExec', onClick: refreshReports,
           }, busy === 'refresh' ? '读取中…' : '查看天源已导入' + fsTypeName(tab) + '（只读）'),
-          localYears.length ? h('button', {
+          showTy && (localYears.length || sd.sheetData) ? h('button', {
+            type: 'button', className: 'pf-btn', onClick: () => setResult(null),
+          }, '返回本地拟导入预览') : null,
+          financeStep === 1 && localYears.length ? h('button', {
             type: 'button', className: 'pf-btn danger',
             title: '只清这台机器上存的本地报表（上方表格会清空）；天源上已经写入的数据不受影响',
             onClick: () => {
               if (!window.confirm('清掉本地已存的 ' + localYears.length + ' 期报表？天源上已经导入的不会动。')) return;
               fsUpdate(project.id, cid, mode, b => ({ balance_sheet: Object.assign(fsEmptyStmt(), { sheetData: null }), income_statement: Object.assign(fsEmptyStmt(), { sheetData: null }) }));
             },
-          }, '清空本地报表（天源不动）') : null,
-          h('button', { type: 'button', className: 'pf-btn', style: { marginLeft: 'auto' }, onClick: () => openSub(financeFolderOf(cur.name)) }, '打开财务资料文件夹'),
-          h('button', { type: 'button', className: 'pf-btn', onClick: () => openSub(financeStatementsFolderOf(cur.name)) }, '打开报表文件夹')),
-        tyHintBox,
+          }, '清空本地报表（天源不动）') : null),
+        // ── 批量预检结果：一次确认写全部
+        financeStep === 2 ? batchBox : null,
+        financeStep === 2 ? tyHintBox : null,
+        h('div', { className: 'fs-step-nav' },
+          financeStep > 0 ? h('button', { type: 'button', className: 'pf-btn', onClick: () => setFinanceStep(financeStep - 1) }, '上一步') : null,
+          financeStep < 2 ? h('button', { type: 'button', className: 'pf-btn pri', onClick: () => goFinanceStep(financeStep + 1) }, '下一步：' + (financeStep === 0 ? '核对本地报表' : '预检与写入')) : null),
+        // 本地核对与预检步骤显示公司身份；明细可按需展开。
+        h('div', { style: { display: financeStep === 0 ? 'none' : '' } },
+        h('p', { className: 'pf-hint' }, '当前公司：' + cur.name + ' · 报表口径：' + fsModeName(mode)),
+        // ── 页签：资产负债表 / 利润表
+        h('div', { className: 'pw-tabs', style: { marginTop: 20, gap: 8, alignItems: 'center', paddingBottom: 8 } },
+          FS_TYPES.map(t => {
+            return h('button', { key: t.key, type: 'button', className: 'pf-btn sm' + (tab === t.key ? ' pri' : ''), onClick: () => { setTab(t.key); setResult(null); } },
+              t.name);
+          }),
+          h('span', { className: 'pf-hint' }, showTy
+            ? ('天源「' + fsTypeName(tab) + '」（' + fsModeName(box.tyMode || mode) + '）的现有数' + (result && result.report ? '，天源已有年度 ' + ((result.report.existingYears || []).join('/') || '无') : ''))
+            : (sd.sheetData
+              ? ((localYears.length > 1 ? '本地 ' + localYears.length + ' 期：' : '本地文件：') + (localYears.length > 1 ? localYears.join('/') : ((sd.fileName || '') + (sd.sheet ? ' · 「' + sd.sheet + '」' : '') + (sd.period ? ' · ' + sd.period : ''))))
+              : '这个页签还没有导入，下面是天源' + fsTypeName(tab) + '的空白报表（可照着填、核对）'))),
+        // ── 明细默认收起，按公司和当前表类型按需展开；不改变本地或天源数据。
+        h('button', { type: 'button', className: 'pf-btn', 'aria-expanded': previewOpen, onClick: () => setPreviewOpen(v => !v) }, previewOpen ? '收起报表预览 ▲' : '展开报表预览 ▼'),
+        previewOpen ? h('div', { className: 'fs-preview' },
+          h('p', { className: 'pf-hint' }, (localYears.length && !showTy)
+            ? ('本地拟导入预览：' + localYears.length + ' 期（' + localYears.join('/') + '）。下表显示本地拟提交金额，不代表天源已保存；核对后预检，确认无误再写入。')
+            : (showTy
+              ? ('天源现有 ' + (((result && result.tyRows) || []).length) + ' 个科目' + (result && result.report ? ('，已有年度 ' + ((result.report.existingYears || []).join('/') || '无') + '，可导入年度 ' + ((result.report.missingYears || []).join('/') || '无')) : '') + '。')
+              : (sd.sheetData
+              ? ('本地文件可写入天源 ' + ((sd.sheetData.detail || []).length) + ' 个科目' + (((sd.sheetData.skipped || []).length) ? ('，跳过 ' + sd.sheetData.skipped.length + ' 行（' + ((sd.sheetData.skipSummary || ['天源模板里没有对应科目']).join('；')) + '）') : '')
+                + (tot['资产总计'] != null ? '；资产总计 ' + fmt(tot['资产总计']) + '，负债+权益 ' + fmt((tot['负债合计'] || 0) + (tot['所有者权益合计'] || 0)) : '')
+                + (((sd.sheetData.duplicates || []).length) ? '；重复挂同一科目 ' + sd.sheetData.duplicates.length + ' 处（保留第一处）' : ''))
+                : '下面按天源模板列出' + fsTypeName(tab) + '的全部科目，金额列按「报表显示期数」排出 ' + periods.map(p => p.year + '-12-31').join('、') + '；点上面「导入' + fsTypeName(tab) + '」读入本地文件后按所属年度填上，没有数据的年度显示「—」。'))),
+          // 本地已存了多期（从「01财务报表」一次导入各期）就按年度列出来逐期核对，这是写天源前的唯一凭据
+          (localYears.length && !showTy)
+            ? fsBlankTable(tab, null, localPeriods, localMemo)
+            : (sd.sheetData && !showTy
+              ? h('div', { className: 'pf-table-wrap', style: { maxHeight: 360, overflow: 'auto' } },
+                h('table', { className: 'pf-grid pw-grid' },
+                  h('thead', null, h('tr', null, ['源表科目', '天源科目'].concat(periods.map(p => p.label)).map((t, i) => h('th', { key: i }, t)))),
+                  h('tbody', null, (sd.sheetData.detail || []).map((r, i) => {
+                    const src = (sd.rows || []).filter(x => String(x.name).replace(/\s/g, '') === String(r.originName).replace(/\s/g, ''))[0] || null;
+                    const vals = src
+                      ? periods.map(p => (p.kind === 'now' ? (src.values || [])[0] : (p.kind === 'prev' ? (src.values || [])[1] : undefined)))
+                      : periods.map(p => (p.kind === 'now' ? r.amount : undefined));
+                    return h('tr', { key: i },
+                      h('td', null, r.originName),
+                      h('td', null, r.subjectName),
+                      vals.map((v, j) => h('td', { key: j, style: { textAlign: 'right' } }, fmt(v))));
+                  }))))
+              : fsBlankTable(tab, showTy ? (((result && result.tyRows) || []).map(w => w.subjectName)) : null, periods, tyMemo))) : null,
         box.lastResult
           ? h('p', { className: 'pf-hint', style: { marginTop: 8 } }, '上次导入：' + (box.lastResult.statementType === 'income_statement' ? '利润表' : '资产负债表') + ' · ' + (box.lastResult.mode === 2 ? '合并' : '单体') + ' · ' + String(box.lastResult.at || '').slice(0, 19).replace('T', ' ') + (box.lastResult.summary ? (' · 写入 ' + box.lastResult.summary.importedSubjectCount + ' 个科目') : ''))
-          : null);
+          : null));
     }
 
     // 管理类底稿：一个项目一套，落在 03评估底稿/管理类底稿/<分类>。
@@ -4438,12 +4705,23 @@ window.__ModuleLoader__.load({
           h('tbody', null, items.map(([k, v]) => h('tr', { key: k }, h('td', null, k), h('td', null, v || '—'))))));
     }
 
-    function FilesPanel({ project, toast, openSub }) {
-      const subs = [['02现场资料/业务委托合同', '业务委托合同'], ['02现场资料/企业提供资料/00财务资料', '财务资料（按公司）'], ['02现场资料/企业提供资料/02基础类', '基础类资料（按公司）'], [MGMT_FOLDER, '管理类底稿'], ['03评估申报', '评估申报与核实资料'], ['05报告', '报告与明细表']];
+    function FilesPanel({ project, s, toast, openSub, onBind }) {
+      const rows = useMemo(() => eqRows(eqListOf(s, project.id)), [s, project.id]);
+      const abs = projectAbs(project);
+      const subs = [['02现场资料/业务委托合同', '业务委托合同'], ['02现场资料/企业提供资料/00财务资料', '财务资料（按公司）'], ['02现场资料/企业提供资料/00财务资料/00未分配财务资料', '未分配财务资料'], ['02现场资料/企业提供资料/02基础类', '基础类资料（按公司）'], [MGMT_FOLDER, '管理类底稿'], ['03评估申报', '评估申报与核实资料'], ['05报告', '报告与明细表']];
       return h('div', null,
+        h('div', { className: 'pf-card', style: { margin: '0 0 10px' } },
+          h('b', null, '项目文件夹绑定'),
+          h('p', { className: 'pf-hint' }, abs
+            ? '已绑定本地文件夹，项目的打开/底稿/归档都认这个目录。'
+            : '尚未绑定真实文件夹：绑定后财务资料、未分配资料等功能才能读写真实目录。'),
+          h('code', { className: 'pf-hint', style: { display: 'block', wordBreak: 'break-all' } }, abs || folderNameOf(project)),
+          h('div', { className: 'pw-acts' },
+            onBind ? h('button', { type: 'button', className: 'pf-btn pri', title: '把这个项目和磁盘上某个文件夹绑定（或改绑、解绑）', onClick: () => onBind(project) }, abs ? '改绑定' : '绑定文件夹') : null,
+            h('button', { type: 'button', className: 'pf-btn', onClick: () => openSub('') }, '打开项目根目录'))),
+        h(UnallocatedFinance, { key: String(project.id), project: project, rows: rows, toast: toast, openSub: openSub }),
         h('p', { className: 'pf-hint' }, '项目文件都在「' + projectFolderLabel(project) + '」下按阶段分目录存放，点下面的按钮直接打开对应目录。'),
         h('div', { className: 'pw-acts' },
-          h('button', { type: 'button', className: 'pf-btn pri', onClick: () => openSub('') }, '打开项目根目录'),
           subs.map(([p2, t]) => h('button', { key: p2, type: 'button', className: 'pf-btn', onClick: () => openSub(p2) }, t))));
     }
 
@@ -4545,11 +4823,11 @@ window.__ModuleLoader__.load({
             sub === 'equity'
               ? (co
                 ? h(CompanyMaterials, { project: project, s: s, toast: toast, openSub: openSub, co: co, onBack: () => setCo(null) })
-                : h(EquityPanel, { project: project, s: s, toast: toast, openSub: openSub, onOpenCo: (id, kind) => setCo({ id: id, kind: kind }) }))
+                : h(EquityPanel, { project: project, s: s, toast: toast, openSub: openSub, onOpenCo: (id, kind) => setCo({ id: id, kind: kind }), goFiles: () => setTab('files') }))
               : h(CatalogPanel, { kind: 'mgmt', project: project, s: s, toast: toast, openSub: openSub }))
           : tab === 'sum' ? h(SummaryPanel, { project: project, s: s, openSub: openSub })
           : tab === 'report' ? h(ReportPanel, { project: project })
-          : tab === 'files' ? h(FilesPanel, { project: project, toast: toast, openSub: openSub })
+          : tab === 'files' ? h(FilesPanel, { project: project, s: s, toast: toast, openSub: openSub, onBind: onBind })
           : tab === 'export' ? h(ExportPanel, { project: project, s: s, toast: toast, openSub: openSub })
           : h(TplPanel, { project: project, toast: toast, openSub: openSub })));
     }
@@ -4569,12 +4847,19 @@ window.__ModuleLoader__.load({
       '.pw-subtabs{display:flex;gap:4px;flex-wrap:wrap;margin-bottom:10px}',
       '.pw-subtab{border:1px solid #e5e7eb;background:#f9fafb;border-radius:6px;padding:5px 12px;font-size:12px;cursor:pointer;color:#374151}',
       '.pw-subtab.on{background:#e8f0ff;border-color:#bcd0ff;color:#1d4ed8;font-weight:600}',
+      '.fs-steps{display:flex;gap:8px;flex-wrap:wrap;border-bottom:1px solid var(--dsh-border,#444);padding:0 0 10px;margin-bottom:12px}',
+      '.fs-step{display:inline-flex;align-items:center;gap:8px;border:1px solid transparent;border-radius:7px;background:transparent;color:inherit;opacity:.7;padding:8px 12px;cursor:pointer}',
+      '.fs-step.active{opacity:1;color:#61b0f2;background:rgba(52,143,215,.14);border-color:rgba(82,163,230,.35);font-weight:600}',
+      '.fs-step-num{display:inline-flex;align-items:center;justify-content:center;width:22px;height:22px;border-radius:50%;background:rgba(127,127,127,.22);font-size:12px}',
+      '.fs-step.active .fs-step-num{background:#428dc9;color:#fff}',
+      '.fs-step-nav{display:flex;gap:8px;justify-content:flex-end;margin:16px 0}',
       '.pw-bar{display:flex;flex-direction:column;gap:8px;margin-bottom:10px}',
       '.pw-filters{display:flex;gap:8px;align-items:center;flex-wrap:wrap}',
       '.pw-filters label{display:flex;align-items:center;gap:6px;font-size:12px;color:#4b5563;white-space:nowrap;flex:0 0 auto}',
       '.pw-filters .pf-in{min-width:150px}',
       '.pw-acts{display:flex;gap:8px;flex-wrap:wrap}',
       '.pw-grid th,.pw-grid td{font-size:12px;white-space:nowrap}',
+      '.fs-preview .pf-table-wrap thead th{position:sticky;top:0;z-index:2}',
       '.pw-hint{font-size:12px;color:#6b7280;margin:0 0 8px;line-height:1.6}',
       '.pw-form{display:flex;flex-direction:column;gap:10px}',
       '.pw-form>label{display:grid;grid-template-columns:96px 1fr;align-items:center;gap:8px;font-size:12px;color:#374151}',

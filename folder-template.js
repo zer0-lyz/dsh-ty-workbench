@@ -39,7 +39,7 @@ function defaultTreeFromPaths() {
   // 生成项目时按公司勾选的方法/科目从这个全集里过滤加载，不在此处动态拼）。
   ['00财务资料', '02基础类', '03资产基础法', '04收益法', '05市场法'].forEach(seg => {
     ensure(['02现场资料', '企业提供资料', seg]);
-    if (seg === '00财务资料') [FIN_STATEMENT_DIR, AUDIT_REPORT_DIR, TB_DIR, AUX_DIR, GL_DIR].forEach(d => ensure(['02现场资料', '企业提供资料', seg, d]));
+    if (seg === '00财务资料') ['00未分配财务资料', FIN_STATEMENT_DIR, AUDIT_REPORT_DIR, TB_DIR, AUX_DIR, GL_DIR].forEach(d => ensure(['02现场资料', '企业提供资料', seg, d]));
     if (seg === '02基础类') BASIC_CATEGORIES.forEach(cat => ensure(['02现场资料', '企业提供资料', seg, cat]));
     if (seg === '04收益法') INCOME_CHILDREN.forEach(ch => ensure(['02现场资料', '企业提供资料', seg, ch]));
     if (seg === '03资产基础法') AB_SUBJECTS.forEach(def => {
@@ -143,14 +143,21 @@ function companyPaths(companies, template) {
     return true;
   });
   const used = new Map();
+  const occupied = new Set(['00未分配财务资料']);
   rows.forEach(c => {
     const name = String((c && c.name) || '').trim();
     if (!name) return;
     const n = (used.get(safeSeg(name)) || 0) + 1;
     used.set(safeSeg(name), n);
     const seg = n === 1 ? safeSeg(name) : safeSeg(name) + '(' + n + ')';
+    const key = seg.normalize('NFC').toLowerCase();
+    if (occupied.has(key)) throw new Error('公司目录名称冲突，无法安全生成目录：' + seg);
+    occupied.add(key);
     const base = '02现场资料/企业提供资料/';
     push(base + '00财务资料/' + seg);
+    // 未分配财务资料（项目级统一收集口）：混放多公司资料先落这里，
+    // 在股权信息页逐项人工确认后分配到各公司夹
+    push(base + '00财务资料/00未分配财务资料');
     // 报表原件夹（公司级固定一层）：客户给的各期报表放这里，「导入报表」扫这个夹
     push(base + '00财务资料/' + seg + '/' + FIN_STATEMENT_DIR);
     push(base + '00财务资料/' + seg + '/' + AUDIT_REPORT_DIR);
